@@ -47,6 +47,14 @@ pub(crate) fn on_wine() -> bool {
     *WINE
 }
 
+/// Whether the page pool's sections are made committed whole
+/// (`SEC_COMMIT`) rather than reserved and committed as views show them:
+/// under Wine, and with the page pool in place on the GPU side
+/// (`VICTORY_POOL_IN_PLACE=1`).
+fn whole_sections() -> bool {
+    on_wine() || victory_gpu::pool_in_place()
+}
+
 /// Standard memory the title has handed to the system.
 static TRANSFERRED: AtomicUsize = AtomicUsize::new(0);
 
@@ -651,6 +659,10 @@ pub extern "system" fn XMemAllocatePhysicalPages(
     // A pagefile-backed section of `size` bytes, its pages committed when
     // first mapped or written (`commit`): the title asks for 6.1
     // GiB at once, which a busy host often cannot commit (error 1450).
+    // Committed whole under Wine, and with `VICTORY_POOL_IN_PLACE=1`: only
+    // a committed section can be opened as a host heap, which the GPU side
+    // then reads and writes in place (`victory_gpu::pool_in_place`).
+    let whole = whole_sections();
     // SAFETY: plain section creation.
     let handle = unsafe {
         CreateFileMappingW(
@@ -660,7 +672,7 @@ pub extern "system" fn XMemAllocatePhysicalPages(
             // touched, and committing a reserved one page by page costs a
             // wineserver request each that scans every range committed so
             // far: commit it whole there.
-            PAGE_READWRITE | if on_wine() { SEC_COMMIT } else { SEC_RESERVE },
+            PAGE_READWRITE | if whole { SEC_COMMIT } else { SEC_RESERVE },
             (size as u64 >> 32) as u32,
             size as u32,
             std::ptr::null(),
@@ -680,7 +692,7 @@ pub extern "system" fn XMemAllocatePhysicalPages(
     );
     // For the GPU side's in-place census: only a committed section can be
     // opened as a host heap.
-    victory_gpu::title_memory_section(handle as usize, size as u64, on_wine());
+    victory_gpu::title_memory_section(handle as usize, size as u64, whole);
     let section = Arc::new(Section {
         handle,
         pages: n,
@@ -1769,8 +1781,8 @@ fn show(base: usize, len: usize, slice: &Slice, own: bool) -> bool {
 
 /// Commits the section pages a view shows (once per page, whichever view).
 fn commit(base: usize, len: usize) -> bool {
-    if on_wine() {
-        return true; // sections are committed whole there
+    if whole_sections() {
+        return true; // sections are committed whole then
     }
     // SAFETY: `[base, base + len)` is a view of a reserved section.
     if !unsafe { VirtualAlloc(base as *const c_void, len, MEM_COMMIT, PAGE_READWRITE) }.is_null() {
