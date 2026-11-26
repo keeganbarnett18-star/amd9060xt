@@ -672,10 +672,36 @@ const SPLIT_KINDS: [u32; 4] = [0, 1, 6, 7];
 /// `ACCC` part, and the pipeline made as [`create_compute`] makes one.
 /// `Err` says why the description is not of that layout; the title then
 /// goes without the pipeline, as it did before this was written.
+///
+/// Off unless `VICTORY_SPLIT_COMPUTE` asks: with these pipelines the title
+/// draws a grey (or black) world on an RX 9060 XT, also when only those
+/// whose program translates are made (`1`: translated at once, the rest
+/// refused); refused all of them it goes another way and renders the world,
+/// faces and all. `all` makes every one, translating or not. Which of them
+/// breaks the frame is not known yet.
 #[cfg(windows)]
 pub(crate) fn create_split_compute(desc: *const u8, iid: *const Iid, out: *mut This) -> Result<HRESULT, &'static str> {
+    #[derive(PartialEq)]
+    enum Mode {
+        Off,
+        Translating,
+        All,
+    }
+    static MODE: OnceLock<Mode> = OnceLock::new();
+    let mode = MODE.get_or_init(|| match std::env::var("VICTORY_SPLIT_COMPUTE").as_deref() {
+        Ok("1") => Mode::Translating,
+        Ok("all") => Mode::All,
+        _ => Mode::Off,
+    });
+    if *mode == Mode::Off {
+        return Err("off (VICTORY_SPLIT_COMPUTE=1 to make them)");
+    }
     let container = split_compute_container(desc)?;
-    Ok(hand_out(vec![shader("compute", &container)], None, iid, out))
+    let s = shader("compute", &container);
+    if *mode == Mode::Translating && s.translated().is_none() {
+        return Err("its program does not translate: refused, so the title goes another way");
+    }
+    Ok(hand_out(vec![s], None, iid, out))
 }
 
 /// The container [`create_split_compute`] makes of the description at `desc`.
