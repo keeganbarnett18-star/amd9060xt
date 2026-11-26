@@ -1193,15 +1193,18 @@ mod host {
             self.empty_until[slot] = None;
             #[allow(unused_mut)]
             let mut pad = convert(&state.Gamepad);
-            // The scripted keys (`VICTORY_KEYS`) also press the first
-            // pad's buttons, by the stand-in pad's table: with a real pad
-            // connected the stand-in is not there, and a title that listens
-            // to the pad (the title's start screen) saw nothing.
+            // The scripted keys (`VICTORY_KEYS`) also work the first pad,
+            // as the stand-in pad reads them (buttons, and W/A/S/D, I/J/K/L
+            // and Z/C as the sticks and triggers): with a real pad connected
+            // the stand-in is not there, and a title that listens to the pad
+            // (the start screen, walking) saw nothing of them.
             if slot == 0 {
-                for vk in scripted() {
-                    if let Some(&(_, button)) = super::FALLBACK_BUTTONS.iter().find(|(key, _)| *key == vk) {
-                        pad.buttons |= button;
-                    }
+                let keys: Vec<super::KeyState> = scripted()
+                    .into_iter()
+                    .map(|vk| super::KeyState { virtual_key: vk, ..Default::default() })
+                    .collect();
+                if !keys.is_empty() {
+                    pad = super::merged(pad, super::fallback(&keys));
                 }
             }
             Some(pad)
