@@ -9,6 +9,7 @@
 
 # Build output
 /target/
+/target-*/
 /tests/fixtures/*/target/
 
 # Local configuration (contains paths to YOUR files)

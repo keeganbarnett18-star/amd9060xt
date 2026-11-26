@@ -365,6 +365,28 @@ extern "system" fn unknown_pipeline<const SLOT: usize>(
     use std::sync::atomic::{AtomicU32, Ordering};
     static CALLS: [AtomicU32; 2] = [const { AtomicU32::new(0) }; 2];
     let calls = CALLS[usize::from(SLOT == 0x218)].fetch_add(1, Ordering::Relaxed) + 1;
+    #[cfg(windows)]
+    split_dump(SLOT, calls, desc);
+    // 0x218: a compute pipeline in pieces (`pipeline::create_split_compute`).
+    #[cfg(windows)]
+    if SLOT == 0x218 {
+        match crate::pipeline::create_split_compute(desc, _iid, out) {
+            Ok(hr) => {
+                if calls == 1 {
+                    tracing::info!("device method 0x218: compute pipelines from their FSPX pieces");
+                }
+                return hr;
+            }
+            Err(why) => {
+                static SAID: std::sync::Mutex<Vec<&'static str>> = std::sync::Mutex::new(Vec::new());
+                let mut said = SAID.lock().unwrap_or_else(|e| e.into_inner());
+                if !said.contains(&why) {
+                    said.push(why);
+                    tracing::warn!(calls, why, "device method 0x218: not a compute pipeline in FSPX pieces");
+                }
+            }
+        }
+    }
     if !out.is_null() {
         // SAFETY: the title's out pointer (a local of its own).
         unsafe { *out = std::ptr::null() };
@@ -397,6 +419,39 @@ extern "system" fn unknown_pipeline<const SLOT: usize>(
         );
     }
     E_NOTIMPL
+}
+
+/// `VICTORY_SPLIT_DUMP=<folder>`: the description of the first 64 calls of
+/// device method 0x1c8 or 0x218, and each piece its words 1-12 name as
+/// (address, size) pairs, written to `<folder>` as
+/// `<slot>-<call>-desc.bin` and `<slot>-<call>-<pair>.bin`, so that the
+/// methods can be read from real bytes.
+#[cfg(windows)]
+fn split_dump(slot: usize, calls: u32, desc: *const u8) {
+    static DIR: std::sync::OnceLock<Option<std::path::PathBuf>> = std::sync::OnceLock::new();
+    let Some(dir) = DIR.get_or_init(|| std::env::var_os("VICTORY_SPLIT_DUMP").map(std::path::PathBuf::from)) else {
+        return;
+    };
+    if calls > 64 || desc.is_null() {
+        return;
+    }
+    let _ = std::fs::create_dir_all(dir);
+    let mut head = [0u8; 0x80];
+    if !crate::host::read_into(desc, &mut head) {
+        return;
+    }
+    let _ = std::fs::write(dir.join(format!("{slot:x}-{calls:02}-desc.bin")), head);
+    let word = |i: usize| u64::from_le_bytes(head[8 * i..8 * i + 8].try_into().expect("8 bytes"));
+    for pair in 0..6 {
+        let (at, size) = (word(1 + 2 * pair), word(2 + 2 * pair));
+        if at == 0 || size == 0 || size > 1 << 20 {
+            continue;
+        }
+        let mut piece = vec![0u8; size as usize];
+        if crate::host::read_into(at as *const u8, &mut piece) {
+            let _ = std::fs::write(dir.join(format!("{slot:x}-{calls:02}-{pair}.bin")), piece);
+        }
+    }
 }
 
 /// The host device's state: the console's device is removed when the host's is

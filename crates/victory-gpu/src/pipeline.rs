@@ -651,6 +651,118 @@ pub(crate) extern "system" fn create_compute_x(
     create_compute(this, desc, iid, out)
 }
 
+/// The FSPX kinds of device method 0x218's four pieces, in description order.
+const SPLIT_KINDS: [u32; 4] = [0, 1, 6, 7];
+
+/// Device method 0x218: a compute pipeline whose program the title hands
+/// over already taken apart, the pieces of an `ACCC` part's FSPX blob
+/// ([`victory_shader::native::fspx_program`]) with the code already placed in
+/// GPU memory (which is title memory: the console's is unified):
+///
+/// ```text
+/// +0x00 root signature
+/// +0x08 u64 address, +0x10 u64 size  FSPX kind 0, pipeline registers (0x1c)
+/// +0x18 u64 address, +0x20 u64 size  FSPX kind 1, pipeline metadata (0x14)
+/// +0x28 u64 address, +0x30 u64 size  FSPX kind 6, the GFX10 code
+/// +0x38 u64 address, +0x40 u64 size  FSPX kind 7, program metadata
+/// +0x48 two addresses, +0x58 a 64-bit hash, then flags (not read)
+/// ```
+///
+/// The pieces are put back together as an FSPX blob in a container of one
+/// `ACCC` part, and the pipeline made as [`create_compute`] makes one.
+/// `Err` says why the description is not of that layout; the title then
+/// goes without the pipeline, as it did before this was written.
+#[cfg(windows)]
+pub(crate) fn create_split_compute(desc: *const u8, iid: *const Iid, out: *mut This) -> Result<HRESULT, &'static str> {
+    let container = split_compute_container(desc)?;
+    Ok(hand_out(vec![shader("compute", &container)], None, iid, out))
+}
+
+/// The container [`create_split_compute`] makes of the description at `desc`.
+#[cfg(windows)]
+fn split_compute_container(desc: *const u8) -> Result<Vec<u8>, &'static str> {
+    let mut head = [0u8; 0x48];
+    if desc.is_null() || !crate::host::read_into(desc, &mut head) {
+        return Err("description not readable");
+    }
+    let word = |i: usize| u64::from_le_bytes(head[8 * i..8 * i + 8].try_into().expect("8 bytes"));
+    let mut pieces: Vec<Vec<u8>> = Vec::with_capacity(SPLIT_KINDS.len());
+    for k in 0..SPLIT_KINDS.len() {
+        let (at, size) = (word(1 + 2 * k), word(2 + 2 * k));
+        if at == 0 || size == 0 || size > 1 << 20 {
+            return Err("a piece of implausible address or size");
+        }
+        let mut piece = vec![0u8; size as usize];
+        if !crate::host::read_into(at as *const u8, &mut piece) {
+            return Err("a piece not readable");
+        }
+        pieces.push(piece);
+    }
+    split_container(&pieces)
+}
+
+/// An FSPX blob of `pieces` (kinds [`SPLIT_KINDS`]) in a container of one
+/// `ACCC` part, after checking that they are what that layout says.
+fn split_container(pieces: &[Vec<u8>]) -> Result<Vec<u8>, &'static str> {
+    let le32 = |b: &[u8], at: usize| b.get(at..at + 4).map(|w| u32::from_le_bytes(w.try_into().expect("4 bytes")));
+    let le16 = |b: &[u8], at: usize| b.get(at..at + 2).map(|w| u16::from_le_bytes(w.try_into().expect("2 bytes")));
+    let [packet, hash, code, meta] = pieces else {
+        return Err("not four pieces");
+    };
+    if packet.len() < 0x1c {
+        return Err("pipeline registers too short");
+    }
+    if (0..3).any(|i| le16(packet, 0x0c + 2 * i).unwrap_or(0) == 0) {
+        return Err("a thread-group size of 0");
+    }
+    if le32(meta, 0) != Some(0x403) {
+        return Err("program metadata not tagged 0x403");
+    }
+    if le32(meta, 8).map(|d| d as usize * 4) != Some(code.len()) {
+        return Err("program metadata and code disagree on the code's size");
+    }
+    // FSPX: header, a 16-byte entry per piece, then the pieces, each at a
+    // 16-byte boundary.
+    let entries = 0x10 + 16 * pieces.len();
+    let mut fspx = vec![0u8; entries];
+    let mut table = Vec::with_capacity(pieces.len());
+    for p in pieces {
+        fspx.resize(fspx.len().next_multiple_of(16), 0);
+        table.push((fspx.len() as u32, p.len() as u32));
+        fspx.extend_from_slice(p);
+    }
+    fspx[0..4].copy_from_slice(b"FSPX");
+    fspx[4..8].copy_from_slice(&1u32.to_le_bytes());
+    fspx[8..12].copy_from_slice(&(pieces.len() as u32).to_le_bytes());
+    let total = fspx.len() as u32;
+    fspx[12..16].copy_from_slice(&total.to_le_bytes());
+    for (i, (&kind, (offset, size))) in SPLIT_KINDS.iter().zip(table).enumerate() {
+        let at = 0x10 + 16 * i;
+        fspx[at..at + 4].copy_from_slice(&kind.to_le_bytes());
+        fspx[at + 4..at + 8].copy_from_slice(&offset.to_le_bytes());
+        fspx[at + 8..at + 12].copy_from_slice(&size.to_le_bytes());
+    }
+    // The container: header, one part offset, the part. Its digest is the
+    // pipeline metadata's first 16 bytes (a hash), so equal programs share one.
+    let part = 0x24usize;
+    let size = part + 8 + fspx.len();
+    let mut c = Vec::with_capacity(size);
+    c.extend_from_slice(b"DXBC");
+    let mut digest = [0u8; 16];
+    let n = hash.len().min(16);
+    digest[..n].copy_from_slice(&hash[..n]);
+    c.extend_from_slice(&digest);
+    c.extend_from_slice(&1u16.to_le_bytes());
+    c.extend_from_slice(&0u16.to_le_bytes());
+    c.extend_from_slice(&(size as u32).to_le_bytes());
+    c.extend_from_slice(&1u32.to_le_bytes());
+    c.extend_from_slice(&(part as u32).to_le_bytes());
+    c.extend_from_slice(b"ACCC");
+    c.extend_from_slice(&(fspx.len() as u32).to_le_bytes());
+    c.extend_from_slice(&fspx);
+    Ok(c)
+}
+
 /// A pipeline described as a stream: its size and the subobjects, each a
 /// type then its data, padded to 8 bytes.
 #[repr(C)]
@@ -801,6 +913,34 @@ mod tests {
             super::parse_skip_hashes(" 0123456789ABCDEF, 0123456789abcde, xyz, 0011223344556677,"),
             ["0123456789abcdef", "0011223344556677"]
         );
+    }
+
+    /// Device method 0x218's pieces come back as a container whose `ACCC`
+    /// part the translator reads as the compute program they make.
+    #[test]
+    fn split_pieces_make_an_fspx_container() {
+        use victory_shader::{Container, FourCC};
+        let mut packet = vec![0u8; 0x1c];
+        packet[0x0c..0x12].copy_from_slice(&[64, 0, 1, 0, 1, 0]); // 64x1x1
+        let hash = vec![7u8; 0x14];
+        let code = vec![0u8; 0x40];
+        let mut meta = vec![0u8; 0x18];
+        meta[0..4].copy_from_slice(&0x403u32.to_le_bytes());
+        meta[8..12].copy_from_slice(&((code.len() / 4) as u32).to_le_bytes());
+        let mut last = [0u8; 32];
+        last[0] = 0x43;
+        meta.extend_from_slice(&last);
+        let c = super::split_container(&[packet.clone(), hash, code.clone(), meta.clone()]).expect("a container");
+        let parsed = Container::parse(&c).expect("parses");
+        assert_eq!(parsed.digest, [7u8; 16]);
+        let part = parsed.part(FourCC::ACCC).expect("an ACCC part");
+        let programs = victory_shader::native_programs(part.data).expect("an FSPX program");
+        assert_eq!(programs.len(), 1);
+        assert_eq!(programs[0].code, code);
+        // A metadata block that disagrees on the code's size is refused.
+        let mut bad = meta;
+        bad[8..12].copy_from_slice(&1u32.to_le_bytes());
+        assert!(super::split_container(&[packet, vec![0; 0x14], code, bad]).is_err());
     }
 
     use super::*;

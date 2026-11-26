@@ -156,7 +156,18 @@ impl Pending {
 pub(crate) fn missing(p: &Pending) -> Option<String> {
     match p.made.get() {
         Some(Some(_)) => None,
-        None => Some("being made".into()),
+        // Which of: never queued, queued (early or asked for), taken by a
+        // worker; and of which shaders, so that one that never ends shows.
+        None => Some(format!(
+            "being made ({}) {:?}",
+            match p.queue_state.load(Ordering::Relaxed) {
+                NOT_QUEUED => "not queued",
+                EARLY => "queued early",
+                REQUESTED => "queued",
+                _ => "a worker has it",
+            },
+            p.shaders
+        )),
         Some(None) => {
             let failed: Vec<String> = p
                 .shaders

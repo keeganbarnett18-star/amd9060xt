@@ -4,10 +4,11 @@ rem Radeon RX 9060 XT (RDNA 4, 8 or 16 GB) on a 32 GB PC: Play-VIctory.cmd's
 rem settings, plus the AMD-side ones. Anything set before this script runs wins.
 rem   set VICTORY_GAME_DIR=F:\path\to\your\dump & Play-9060XT.cmd
 
-rem The threaded submission paths: Play-VIctory.cmd keeps them off for NVIDIA
-rem only (faces, repeated video frames); the 7900 XTX findings were taken with
-rem them on. Set either to 0 if faces or the opening video look wrong.
-if not defined VICTORY_THIN set "VICTORY_THIN=1"
+rem The threaded submission paths. THIN stays off: on this card too, with it on
+rem the head skin of people in play is not drawn (eyes and teeth are), as
+rem Play-VIctory.cmd notes for NVIDIA. JOIN_PARTS=8 as the 7900 XTX findings;
+rem set it to 0 if the opening video repeats frames.
+if not defined VICTORY_THIN set "VICTORY_THIN=0"
 if not defined VICTORY_JOIN_PARTS set "VICTORY_JOIN_PARTS=8"
 
 rem 1080p out: after the preparing thread the card is the next wall
