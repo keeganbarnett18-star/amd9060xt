@@ -25,9 +25,7 @@ set "VICTORY_CARD_AWAKE=1"
 set "VICTORY_SHOW_AFTER=1"
 set "VICTORY_THIN=1"
 set "VICTORY_JOIN_PARTS=8"
-if not defined VICTORY_PORT_CONSTANTS set "VICTORY_PORT_CONSTANTS=1"
-if not defined VICTORY_PORT_CBV set "VICTORY_PORT_CBV=1"
-if not defined VICTORY_UPLOAD_AHEAD set "VICTORY_UPLOAD_AHEAD=1"
+set "VICTORY_UPLOAD_AHEAD=1"
 set "VICTORY_LEVELS_ON_DEMAND=1"
 
 :: 4 GB VRAM tuning: reduce card-buffer thrashing and driver background recompile threads
