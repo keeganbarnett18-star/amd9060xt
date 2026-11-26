@@ -11,6 +11,13 @@ rem set it to 0 if the opening video repeats frames.
 if not defined VICTORY_THIN set "VICTORY_THIN=0"
 if not defined VICTORY_JOIN_PARTS set "VICTORY_JOIN_PARTS=8"
 
+rem The texture write guard on: textures are hashed every eighth frame unless
+rem a write was seen, not at every check. Measured on this card over the same
+rem stretch of the prologue: 39.3 ms a frame against 46.5 (texture refreshes
+rem 2.7 ms against 13.8). Play-VIctory.cmd keeps it off for colour noise on
+rem skin seen elsewhere; none showed here. Set it to 0 if skin looks noisy.
+if not defined VICTORY_TEXTURE_GUARD set "VICTORY_TEXTURE_GUARD=1"
+
 rem 1080p out: after the preparing thread the card is the next wall
 rem (docs/findings.md), and this card has about half a 7900 XTX's shaders.
 rem The title's modes: 1280x720 1664x936 1920x1080 2560x1440 3840x2160.
