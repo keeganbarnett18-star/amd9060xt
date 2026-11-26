@@ -535,6 +535,10 @@ pub fn fspx_program(part: &[u8]) -> Result<NativeProgram, ShaderError> {
         let sgprs = match root {
             RootType::Table => 1,
             RootType::Descriptor => 2,
+            // Root constants (a constant buffer register, b500 and up in
+            // the title's compute programs): their words in user SGPRs, as
+            // many as the record's descriptor dwords say.
+            RootType::Constants => u32::from(e[20]),
             // The code holds its words; no user data.
             RootType::ImmediateSampler => 0,
             _ => return Err(Malformed("an FSPX resource of an unknown root type")),
@@ -861,6 +865,55 @@ fn bytes(data: &[u8], offset: u64, len: u64) -> Option<&[u8]> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// An FSPX blob of registers, code and the metadata `records`.
+    fn fspx(records: &[[u8; 32]]) -> Vec<u8> {
+        let mut packet = vec![0u8; 0x1c];
+        packet[0x0c..0x12].copy_from_slice(&[64, 0, 1, 0, 1, 0]);
+        let code = vec![0u8; 16];
+        let mut meta = vec![0u8; 0x18];
+        meta[0..4].copy_from_slice(&0x403u32.to_le_bytes());
+        meta[8..12].copy_from_slice(&4u32.to_le_bytes());
+        for r in records {
+            meta.extend_from_slice(r);
+        }
+        let mut last = [0u8; 32];
+        last[0] = 0x43;
+        meta.extend_from_slice(&last);
+        let pieces = [(0u32, packet), (6, code), (7, meta)];
+        let mut out = vec![0u8; 0x10 + 16 * pieces.len()];
+        out[0..4].copy_from_slice(b"FSPX");
+        out[4..8].copy_from_slice(&1u32.to_le_bytes());
+        out[8..12].copy_from_slice(&(pieces.len() as u32).to_le_bytes());
+        for (i, (kind, p)) in pieces.iter().enumerate() {
+            let at = 0x10 + 16 * i;
+            let offset = out.len() as u32;
+            out[at..at + 4].copy_from_slice(&kind.to_le_bytes());
+            out[at + 4..at + 8].copy_from_slice(&offset.to_le_bytes());
+            out[at + 8..at + 12].copy_from_slice(&(p.len() as u32).to_le_bytes());
+            out.extend_from_slice(p);
+        }
+        out
+    }
+
+    /// Root constants (root type 0) in a title's compute program: as many
+    /// user SGPRs as the record's descriptor dwords, at its user-data dword.
+    #[test]
+    fn fspx_root_constants_take_their_dwords_of_user_data() {
+        let mut r = [0u8; 32];
+        r[0] = 0x41;
+        r[4] = 2; // a constant buffer register
+        r[5] = 0; // root constants
+        r[12..16].copy_from_slice(&500u32.to_le_bytes()); // b500
+        r[20] = 4; // four dwords
+        r[21] = 5; // from user-data dword 5
+        r[22] = 1; // root slot 1
+        let p = fspx_program(&fspx(&[r])).expect("parses");
+        assert_eq!(p.layout.len(), 1);
+        assert_eq!(p.layout[0].root, RootType::Constants);
+        assert_eq!((p.layout[0].sgprs, p.layout[0].user_data, p.layout[0].slot, p.layout[0].base_register), (4, 5, 1, 500));
+        assert_eq!(p.used[0].kind, ResourceType::Cbv);
+    }
 
     const VS_CODE: [u8; 8] = [1, 2, 3, 4, 5, 6, 7, 8];
     const PS_CODE: [u8; 4] = [9, 10, 11, 12];
