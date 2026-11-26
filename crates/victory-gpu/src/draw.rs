@@ -2596,6 +2596,8 @@ impl State {
         if room {
             host.texture_slots_waiting(frame);
         }
+        // And those whose host copy was moved out of a block being emptied.
+        host.texture_slots_moved(frame);
         let required = PASS_BUDGET.get().is_some_and(|(_, _, bake)| bake);
         let (mut due, census) = host.texture_slots_due(frame, if baking { 1 << 16 } else { 4096 });
         // (Those that are due later after all that are due.)

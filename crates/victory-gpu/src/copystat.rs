@@ -790,7 +790,19 @@ fn log_memory() {
     );
     {
         let [textures, staging] = crate::pool::memory();
-        tracing::info!("memory in blocks (VICTORY_TEXTURE_POOL=0 turns them off): {textures} MB of textures, {staging} MB of their staging buffers");
+        let held = crate::pool::texture_blocks().0.iter().flatten().map(|b| b.0).sum::<u64>() >> 20;
+        let [blocks, copies] = [0, 1].map(|i| crate::resource::BLOCKS_FREED[i].load(Relaxed));
+        let drained = crate::pool::DRAINED.load(Relaxed);
+        let (tenths, ranges, largest, resting) = crate::pool::texture_fill();
+        tracing::info!(
+            "blocks of textures by tenths held (0-9, full): {tenths:?}; {ranges} free ranges, the largest of each block summed {largest} MB; {resting} pieces resting; blocks made for want of room since the start: {}, for {} MB of pieces, {} of them under 1 MiB",
+            crate::pool::GROWN[0].load(Relaxed),
+            crate::pool::GROWN[1].load(Relaxed) >> 20,
+            crate::pool::GROWN[2].load(Relaxed)
+        );
+        tracing::info!(
+            "memory in blocks (VICTORY_TEXTURE_POOL=0 turns them off): {textures} MB of textures ({held} MB of them held), {staging} MB of their staging buffers; emptied to stay under the card's budget (VICTORY_FREE_BLOCKS=0: not) since the start: {blocks} blocks drained, {copies} host copies moved out of them, {drained} blocks emptied"
+        );
     }
     let targets = crate::resource::targets_census();
     tracing::info!(

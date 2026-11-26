@@ -28,6 +28,19 @@ use windows::core::{GUID, HRESULT, IUnknown, Interface};
 /// Bytes of a block; pieces of more than half of one are not pooled (with
 /// blocks made ahead, [`ahead`]: of more than one).
 const BLOCK: u64 = 64 << 20;
+/// Bytes of a block of textures (`VICTORY_TEXTURE_BLOCK_MB`, 4 to 64; 64 by
+/// default). A block goes back to the system only once no texture is in it:
+/// in run 21 (RX 9060 XT, 2026-11-26) 159 blocks of 64 MiB held 6.3 GB of
+/// textures in 10.2 GB, in 4,200 free ranges, almost every block with a
+/// texture in use in it, and the card stayed 1.6 GB over its budget.
+pub(crate) fn texture_block() -> u64 {
+    static SIZE: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
+    *SIZE.get_or_init(|| {
+        let mb: u64 = std::env::var("VICTORY_TEXTURE_BLOCK_MB").ok().and_then(|v| v.trim().parse().ok()).unwrap_or(64);
+        mb.clamp(4, 64).next_power_of_two() << 20
+    })
+}
+
 /// Blocks with nothing in them that are kept.
 const SPARE: usize = 2;
 /// The same while the card has room ([`room`]): 4 GiB of them.
@@ -124,6 +137,20 @@ impl Ripe {
     }
 }
 
+/// Whether new pieces are cut from the fullest block with room
+/// (`VICTORY_TEXTURE_PACK=0`: from the first, as before).
+fn packed() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_TEXTURE_PACK").is_none_or(|v| v != "0"))
+}
+
+/// Blocks of textures emptied whole after [`drain`] since the start.
+pub(crate) static DRAINED: AtomicU64 = AtomicU64::new(0);
+
+/// Blocks made for a piece no block had room for: how many, the pieces'
+/// bytes, and how many of those were under 1 MiB.
+pub(crate) static GROWN: [AtomicU64; 3] = [const { AtomicU64::new(0) }; 3];
+
 /// Pieces cut from blocks that were not ripe, for want of a ripe one.
 static UNRIPE: AtomicU64 = AtomicU64::new(0);
 
@@ -149,6 +176,11 @@ impl Ranges {
             self.0.insert(at + len, start + size - at - len);
         }
         Some(at)
+    }
+
+    /// Whether `len` bytes at a multiple of `align` have a place.
+    fn fits(&self, len: u64, align: u64) -> bool {
+        self.0.iter().any(|(&start, &size)| start.next_multiple_of(align) + len <= start + size)
     }
 
     fn give(&mut self, mut start: u64, mut len: u64) {
@@ -183,6 +215,10 @@ struct Block<B> {
     /// The end of the highest piece ever taken: above it the memory is as
     /// it was made (zeros).
     used_to: u64,
+    /// Bytes of the pieces taken from it and not given back.
+    held: u64,
+    /// Being emptied ([`drain`]): no new pieces are cut from it.
+    draining: bool,
     /// The newest submission begun when it was made ([`Ripe`]).
     made: u64,
     /// When that was (ms).
@@ -199,11 +235,13 @@ struct Pool<B> {
     spare: usize,
     most: usize,
     retry_growth_at: u64,
+    /// Bytes of each of its blocks.
+    size: u64,
 }
 
 impl<B: Clone> Pool<B> {
     const fn new(most: usize) -> Pool<B> {
-        Pool { blocks: Vec::new(), resting: VecDeque::new(), spare: 0, most, retry_growth_at: 0 }
+        Pool { blocks: Vec::new(), resting: VecDeque::new(), spare: 0, most, retry_growth_at: 0, size: BLOCK }
     }
 
     /// A piece of `len` bytes and the memory it lies in, and whether that
@@ -224,32 +262,53 @@ impl<B: Clone> Pool<B> {
     ) -> Option<(Piece, B, bool)> {
         // With blocks made ahead, what would be an allocation of its own (and
         // new when the card first reads it) lies in one of those too.
-        if len == 0 || len > if ripe.ahead > 0 { BLOCK } else { BLOCK / 2 } {
+        if len == 0 || len > if ripe.ahead > 0 { self.size } else { self.size / 2 } {
             return None;
         }
         self.rested(now);
+        // The fullest block that has room ([`packed`]; else the first):
+        // what is let go then leaves the emptier blocks whole sooner.
+        let pack = packed();
         let mut found = None;
+        let mut best: Option<(u64, usize)> = None;
         for (i, block) in self.blocks.iter_mut().enumerate() {
             if let Some(block) = block
                 && ripe.is(block)
-                && let Some(start) = block.free.take(len, align)
+                && !block.draining
             {
-                found = Some((i, start));
-                break;
+                if pack {
+                    if best.is_none_or(|(held, _)| block.held > held) && block.free.fits(len, align) {
+                        best = Some((block.held, i));
+                    }
+                } else if let Some(start) = block.free.take(len, align) {
+                    found = Some((i, start));
+                    break;
+                }
             }
+        }
+        if let Some((_, i)) = best {
+            found = self.blocks[i].as_mut().and_then(|b| Some((i, b.free.take(len, align)?)));
         }
         if found.is_none() && ripe.ahead > 0 {
             // The one that has been there the longest.
             let mut unripe: Vec<(u64, usize)> =
                 self.blocks.iter().enumerate().filter_map(|(i, b)| Some((b.as_ref()?.made, i))).collect();
             unripe.sort_unstable();
-            found = unripe.into_iter().find_map(|(_, i)| Some((i, self.blocks[i].as_mut()?.free.take(len, align)?)));
+            found = unripe.into_iter().find_map(|(_, i)| {
+                let block = self.blocks[i].as_mut().filter(|b| !b.draining)?;
+                Some((i, block.free.take(len, align)?))
+            });
         }
         // A failed 64 MiB block must not trigger another driver call for each
         // small texture. Existing free ranges remain usable during backoff.
         let (i, start) = match found {
             Some(found) => found,
             None => {
+                GROWN[0].fetch_add(1, Ordering::Relaxed);
+                GROWN[1].fetch_add(len, Ordering::Relaxed);
+                if len < (1 << 20) {
+                    GROWN[2].fetch_add(1, Ordering::Relaxed);
+                }
                 let memory = self.grow(now, &mut make)?;
                 let i = self.add(memory, ripe.started);
                 (i, self.blocks[i].as_mut()?.free.take(len, align)?)
@@ -262,7 +321,7 @@ impl<B: Clone> Pool<B> {
                     tracing::info!("textures cut from blocks made while lists ran that still run: {n}");
                 }
             }
-            let empty = self.blocks.iter().flatten().filter(|b| b.free.whole(BLOCK)).count();
+            let empty = self.blocks.iter().flatten().filter(|b| b.free.whole(self.size)).count();
             if empty < ripe.ahead
                 && let Some(memory) = self.grow(now, &mut make)
             {
@@ -270,6 +329,7 @@ impl<B: Clone> Pool<B> {
             }
         }
         let block = self.blocks[i].as_mut()?;
+        block.held += len;
         let again = start < block.used_to;
         block.used_to = block.used_to.max(start + len);
         Some((Piece { block: i, start, len }, block.memory.clone(), again))
@@ -294,11 +354,14 @@ impl<B: Clone> Pool<B> {
                 self.blocks.len() - 1
             }
         };
-        self.blocks[i] = Some(Block { memory, free: Ranges::new(BLOCK), used_to: 0, made, since: crate::host::now_ms() });
+        self.blocks[i] = Some(Block { memory, free: Ranges::new(self.size), used_to: 0, held: 0, draining: false, made, since: crate::host::now_ms() });
         i
     }
 
     fn give(&mut self, piece: Piece, now: u64) {
+        if let Some(Some(block)) = self.blocks.get_mut(piece.block) {
+            block.held = block.held.saturating_sub(piece.len);
+        }
         self.resting.push_back((now + REST, piece));
     }
 
@@ -316,7 +379,13 @@ impl<B: Clone> Pool<B> {
             self.resting.pop_front();
             if let Some(block) = self.blocks[piece.block].as_mut() {
                 block.free.give(piece.start, piece.len);
-                any |= block.free.whole(BLOCK);
+                if block.free.whole(self.size) {
+                    any = true;
+                    if block.draining {
+                        block.draining = false;
+                        DRAINED.fetch_add(1, Ordering::Relaxed);
+                    }
+                }
             }
         }
         // (Without a piece given back too, once there is less room.)
@@ -325,7 +394,7 @@ impl<B: Clone> Pool<B> {
         if sweep || any || most < previous {
             let mut spare = 0;
             for block in &mut self.blocks {
-                if block.as_ref().is_some_and(|b| b.free.whole(BLOCK)) {
+                if block.as_ref().is_some_and(|b| b.free.whole(self.size)) {
                     spare += 1;
                     if spare > most {
                         *block = None;
@@ -359,13 +428,66 @@ static HELD: AtomicU64 = AtomicU64::new(0);
 /// Bytes of the texture blocks no texture holds: the card's memory in use
 /// by us that new textures take first.
 pub(crate) fn texture_room() -> u64 {
-    (lock(&TEXTURES).blocks() as u64 * BLOCK).saturating_sub(HELD.load(Ordering::Relaxed))
+    (lock(&TEXTURES).blocks() as u64 * texture_block()).saturating_sub(HELD.load(Ordering::Relaxed))
+}
+
+/// The bytes each block of textures holds and whether it is draining, by
+/// its index (`None`: a block let go), and the size of a block.
+pub(crate) fn texture_blocks() -> (Vec<Option<(u64, bool)>>, u64) {
+    (lock(&TEXTURES).blocks.iter().map(|b| b.as_ref().map(|b| (b.held, b.draining))).collect(), texture_block())
+}
+
+/// Cuts no new pieces from these blocks of textures, so that they empty as
+/// their textures go and are given back.
+pub(crate) fn drain(blocks: &[usize]) {
+    let mut pool = lock(&TEXTURES);
+    for &i in blocks {
+        if let Some(Some(block)) = pool.blocks.get_mut(i)
+            && block.held > 0
+        {
+            block.draining = true;
+        }
+    }
+}
+
+/// For the memory line: the blocks of textures by how full they are (tenths),
+/// their free ranges, the largest free range of all blocks summed (MiB),
+/// and the pieces resting.
+#[cfg(feature = "diagnostics")]
+pub(crate) fn texture_fill() -> ([u32; 11], usize, u64, usize) {
+    let pool = lock(&TEXTURES);
+    let mut tenths = [0u32; 11];
+    let (mut ranges, mut largest) = (0usize, 0u64);
+    for block in pool.blocks.iter().flatten() {
+        tenths[(block.held * 10 / texture_block()).min(10) as usize] += 1;
+        ranges += block.free.0.len();
+        largest += block.free.0.values().copied().max().unwrap_or(0);
+    }
+    (tenths, ranges, largest >> 20, pool.resting.len())
+}
+
+/// The block of textures `texture` lies in and the bytes of its piece, if
+/// it was made in one.
+pub(crate) fn block_of(texture: &ID3D12Resource) -> Option<(usize, u64)> {
+    let mut size = std::mem::size_of::<*mut c_void>() as u32;
+    let mut object: *mut c_void = std::ptr::null_mut();
+    // SAFETY: the key holds an interface (`give_back_with`): its pointer,
+    // with a reference taken for us, which is dropped below.
+    unsafe {
+        texture.GetPrivateData(&RECLAIM_KEY, &mut size, Some((&raw mut object).cast())).ok()?;
+        if object.is_null() || size as usize != std::mem::size_of::<*mut c_void>() {
+            return None;
+        }
+        let piece = (*object.cast::<Reclaim>()).piece;
+        release(object);
+        Some((piece.block, piece.len))
+    }
 }
 
 /// For the memory line: blocks of textures and of staging buffers, in MiB.
 #[cfg(feature = "diagnostics")]
 pub(crate) fn memory() -> [u64; 2] {
-    [lock(&TEXTURES).blocks() as u64 * (BLOCK >> 20), lock(&STAGING).blocks() as u64 * (BLOCK >> 20)]
+    [lock(&TEXTURES).blocks() as u64 * (texture_block() >> 20), lock(&STAGING).blocks() as u64 * (BLOCK >> 20)]
 }
 
 /// Part of a block of mapped upload memory, back in the pool when dropped.
@@ -479,8 +601,10 @@ fn made_now(texture: &ID3D12Resource) {
 }
 
 /// Makes `texture` give `piece` back when the last reference to it goes.
+const RECLAIM_KEY: GUID = GUID::from_u128(0x6f0e2f0c_5a59_4b1e_9a3f_7f4d2c9be713);
+
 fn give_back_with(texture: &ID3D12Resource, piece: Piece) {
-    const KEY: GUID = GUID::from_u128(0x6f0e2f0c_5a59_4b1e_9a3f_7f4d2c9be713);
+    const KEY: GUID = RECLAIM_KEY;
     let made = Box::into_raw(Box::new(Reclaim { methods: &RECLAIM.0, references: AtomicU32::new(1), piece }));
     // SAFETY: a COM object of ours with one reference, which this takes and
     // drops at the end; the texture takes its own.
@@ -522,9 +646,14 @@ pub(crate) unsafe fn texture(
         return None;
     }
     #[cfg_attr(not(feature = "diagnostics"), allow(unused_variables))]
-    let (piece, heap, again) = lock(&TEXTURES).take_ripe(info.SizeInBytes, info.Alignment.max(1), now(), Ripe::now(), || {
+    let (piece, heap, again) = {
+        let mut pool = lock(&TEXTURES);
+        pool.size = texture_block();
+        pool
+    }
+    .take_ripe(info.SizeInBytes, info.Alignment.max(1), now(), Ripe::now(), || {
         let desc = D3D12_HEAP_DESC {
-            SizeInBytes: BLOCK,
+            SizeInBytes: texture_block(),
             Properties: D3D12_HEAP_PROPERTIES { Type: D3D12_HEAP_TYPE_DEFAULT, ..Default::default() },
             Alignment: 0,
             Flags: D3D12_HEAP_FLAG_ALLOW_ONLY_NON_RT_DS_TEXTURES | crate::host::not_resident(),
@@ -555,7 +684,7 @@ pub(crate) unsafe fn texture(
             #[cfg(feature = "diagnostics")]
             {
                 crate::book::made(&made, || "a texture in a block".into());
-                crate::book::block(&heap, &made, piece.start, BLOCK);
+                crate::book::block(&heap, &made, piece.start, texture_block());
                 crate::book::note(made.as_raw() as usize, || {
                     let block = lock(&TEXTURES).blocks.get(piece.block).and_then(Option::as_ref).map(|b| (b.made, b.since));
                     let (submission, since) = block.unwrap_or_default();
@@ -603,6 +732,18 @@ mod tests {
         assert_eq!(spares(Some([100, 85, 0, 0]), true), SPARE);
         assert_eq!(spares(Some([100, 10, 0, 0]), false), SPARE);
         assert_eq!(spares(None, true), SPARE);
+    }
+
+    #[test]
+    fn blocks_count_what_their_pieces_hold() {
+        let mut pool: Pool<u64> = Pool::new(SPARE_KEPT);
+        let (a, _, _) = pool.take(BLOCK / 4, 1, 0, || Some(1)).unwrap();
+        let (b, _, _) = pool.take(BLOCK / 8, 1, 0, || Some(2)).unwrap();
+        assert_eq!(pool.blocks[0].as_ref().unwrap().held, BLOCK / 4 + BLOCK / 8);
+        pool.give(a, 0);
+        assert_eq!(pool.blocks[0].as_ref().unwrap().held, BLOCK / 8);
+        pool.give(b, 0);
+        assert_eq!(pool.blocks[0].as_ref().unwrap().held, 0);
     }
 
     #[test]

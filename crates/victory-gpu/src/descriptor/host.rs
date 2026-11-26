@@ -493,6 +493,18 @@ fn record_key(handle: u64) -> u64 {
 /// ([`HostHeap::texture_slots_waiting`]).
 static WAITING: Mutex<std::collections::BTreeMap<u64, u64>> = Mutex::new(std::collections::BTreeMap::new());
 
+/// Placed textures (by the start of their memory) whose host copy was
+/// replaced to empty a block of textures (`crate::resource` `free_blocks`),
+/// and when: their slots are made due again, so the new copy is made and
+/// uploaded and the slots are made from it.
+static MOVED: Mutex<std::collections::BTreeMap<u64, u64>> = Mutex::new(std::collections::BTreeMap::new());
+
+/// The host copy of the placed texture at `start` was replaced to empty a
+/// block of textures.
+pub(crate) fn moved(start: u64) {
+    MOVED.lock().unwrap_or_else(|e| e.into_inner()).insert(start, crate::host::moment());
+}
+
 /// The last upload of the placed texture at `start` left a held level
 /// without tiles. A texture picked by index is uploaded once and then
 /// only when its memory is found changed, and its staging buffer goes
@@ -2071,11 +2083,23 @@ impl HostHeap {
     /// how many slots it made due.
     /// shortcut: kept in one place for all heaps, as the starts below.
     pub(crate) fn texture_slots_waiting(&self, frame: u64) -> usize {
+        self.texture_slots_from(&WAITING, frame)
+    }
+
+    /// The same for placed textures whose host copy was moved out of a
+    /// block being emptied ([`moved`]), with room or without: the new copy
+    /// takes no more of the card than the old one, which goes once the
+    /// slots are made from the new one.
+    pub(crate) fn texture_slots_moved(&self, frame: u64) -> usize {
+        self.texture_slots_from(&MOVED, frame)
+    }
+
+    fn texture_slots_from(&self, from: &Mutex<std::collections::BTreeMap<u64, u64>>, frame: u64) -> usize {
         if self.sampler {
             return 0;
         }
         let starts: Vec<u64> = {
-            let mut waiting = WAITING.lock().unwrap_or_else(|e| e.into_inner());
+            let mut waiting = from.lock().unwrap_or_else(|e| e.into_inner());
             if waiting.is_empty() {
                 return 0;
             }

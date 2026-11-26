@@ -2096,23 +2096,14 @@ pub(crate) fn let_go_idle() {
         PART
     };
     let from = if part == PART { FROM.load(Relaxed) } else { 0 };
-    let mut looked = 0;
-    let began = std::time::Instant::now();
-    for at in all.range(from..).take(part).copied().chain(by_age.iter().map(|&(_, at)| at)) {
-        if bytes >= most {
-            break;
-        }
-        looked += 1;
-        if part == PART {
-            FROM.store(if looked == PART { at + 1 } else { 0 }, Relaxed);
-        }
+    let let_go = |at: usize, idle_ms: u64| -> Option<u64> {
         // SAFETY: a texture leaves the table before it is freed, under the
         // lock held here (`Drop for Resource`).
         let r = unsafe { &*(at as *const Resource) };
         // (Without its lock first: most were used lately or have none.)
         let used = r.host.used.load(Relaxed);
         if used == 0 || !fills(&r.desc) || !crate::host::long_ago(used, idle_ms, IDLE_FRAMES) || crate::texture::host_wrote(at) {
-            continue;
+            return None;
         }
         let gone = {
             let mut made = r.host.made.lock().unwrap_or_else(|e| e.into_inner());
@@ -2131,18 +2122,37 @@ pub(crate) fn let_go_idle() {
                 None
             }
         };
-        if let Some((host, _)) = gone {
-            r.host.gone.store(true, Relaxed);
-            KINDS[2].fetch_add(1, Relaxed);
-            KINDS[3].fetch_add(host.bytes, Relaxed);
+        let (host, _) = gone?;
+        r.host.gone.store(true, Relaxed);
+        KINDS[2].fetch_add(1, Relaxed);
+        KINDS[3].fetch_add(host.bytes, Relaxed);
+        let b = host.bytes;
+        crate::host::retire(host);
+        Some(b)
+    };
+    let mut looked = 0;
+    let began = std::time::Instant::now();
+    for at in all.range(from..).take(part).copied().chain(by_age.iter().map(|&(_, at)| at)) {
+        if bytes >= most {
+            break;
+        }
+        looked += 1;
+        if part == PART {
+            FROM.store(if looked == PART { at + 1 } else { 0 }, Relaxed);
+        }
+        if let Some(b) = let_go(at, idle_ms) {
             went += 1;
-            bytes += host.bytes;
+            bytes += b;
             if first.is_none() {
                 first = Some(at);
             }
-            crate::host::retire(host);
         }
     }
+    // Over the card's budget as the system counts it: blocks of textures
+    // whose every piece is idle are emptied whole, so the blocks go back.
+    let (freed, freed_bytes) = free_blocks(&all, memory, &mut |at| let_go(at, BLOCK_IDLE_MS));
+    went += freed;
+    bytes += freed_bytes;
     SWEPT_US[0].fetch_add(1, Relaxed);
     SWEPT_US[1].fetch_add(began.elapsed().as_micros() as u64, Relaxed);
     SWEPT_US[2].fetch_max(began.elapsed().as_micros() as u64, Relaxed);
@@ -2161,6 +2171,124 @@ pub(crate) fn let_go_idle() {
 /// longest one's.
 #[cfg(windows)]
 pub(crate) static SWEPT_US: [std::sync::atomic::AtomicU64; 3] = [const { std::sync::atomic::AtomicU64::new(0) }; 3];
+
+/// How long a texture must have been idle for [`let_go_idle`] at a look
+/// made for [`free_blocks`] (unused there now), in milliseconds.
+#[cfg(windows)]
+const BLOCK_IDLE_MS: u64 = 2_000;
+
+/// Since the start: blocks of textures [`free_blocks`] emptied, and the
+/// host copies it let go for them.
+#[cfg(windows)]
+pub(crate) static BLOCKS_FREED: [std::sync::atomic::AtomicU64; 2] = [const { std::sync::atomic::AtomicU64::new(0) }; 2];
+
+/// Whether [`free_blocks`] runs (`VICTORY_FREE_BLOCKS=0`: not, as before).
+#[cfg(windows)]
+fn free_blocks_on() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_FREE_BLOCKS").is_none_or(|v| v != "0"))
+}
+
+/// While the card's memory in use, as the system counts it, is over 92 %
+/// of its budget: the emptiest blocks of textures ([`crate::pool`], under
+/// two fifths held) are drained ([`crate::pool::drain`]: no new piece is
+/// cut from them) until what they would give back meets 88 %, at most 8
+/// more at a look; and up to [`MOVE_BYTES`] of the host copies in draining
+/// blocks are replaced, as [`want_level`] replaces one: the next use makes
+/// the copy anew (in the fullest block with room) and uploads it, and the
+/// slots that show the old one are made from the new one once that upload
+/// has run (`crate::descriptor::host::moved`); the old one goes when
+/// nothing holds it, and with the last of them its block. Returns the
+/// copies let go here (none: replaced copies are counted apart).
+///
+/// [`let_go_idle`]'s own rule counts the room in blocks as free, but a
+/// block with one piece taken is the card's memory all the same: in runs
+/// 20 to 22 (RX 9060 XT, 2026-11-26) 159 blocks of 64 MiB held 6.3 GB of
+/// textures in 10.2 GB, in 4,200 free ranges, with a texture in use in
+/// nearly every block (none could be let go whole), the card 16.3 GB in
+/// use of a budget of 14.6 and the PC's memory shared with it growing.
+/// With this (run 24): 8.6 GB of blocks for 6.4 GB, the card 13.7 GB.
+#[cfg(windows)]
+fn free_blocks(
+    all: &std::collections::BTreeSet<usize>,
+    memory: Option<[u64; 4]>,
+    _let_go: &mut dyn FnMut(usize) -> Option<u64>,
+) -> (u64, u64) {
+    use std::sync::atomic::Ordering::Relaxed;
+    const MOST_DRAINED: usize = 8;
+    let Some([budget, used, ..]) = memory else {
+        return (0, 0);
+    };
+    if !free_blocks_on() || budget == 0 || u128::from(used) * 100 <= u128::from(budget) * 92 {
+        return (0, 0);
+    }
+    let want = used.saturating_sub(budget / 100 * 88);
+    let (blocks, size) = crate::pool::texture_blocks();
+    let mut draining: Vec<bool> = blocks.iter().map(|b| b.is_some_and(|b| b.1)).collect();
+    let mut coming: u64 = blocks.iter().flatten().filter(|b| b.1).map(|_| size).sum();
+    if coming < want {
+        let mut sparse: Vec<(u64, usize)> = blocks
+            .iter()
+            .enumerate()
+            .filter_map(|(i, b)| b.filter(|&(held, d)| !d && held > 0 && held * 5 < size * 2).map(|(held, _)| (held, i)))
+            .collect();
+        sparse.sort_unstable();
+        let mut chosen = Vec::new();
+        for (_, i) in sparse.into_iter().take(MOST_DRAINED) {
+            if coming >= want {
+                break;
+            }
+            coming += size;
+            draining[i] = true;
+            chosen.push(i);
+        }
+        crate::pool::drain(&chosen);
+        BLOCKS_FREED[0].fetch_add(chosen.len() as u64, Relaxed);
+    }
+    if !draining.contains(&true) {
+        return (0, 0);
+    }
+    let (mut moved, mut bytes) = (0u64, 0u64);
+    for &at in all {
+        if bytes >= MOVE_BYTES {
+            break;
+        }
+        // SAFETY: as in `let_go_idle`, whose lock on the table is held.
+        let r = unsafe { &*(at as *const Resource) };
+        if !fills(&r.desc) || !r.host.placed.load(Relaxed) || r.host.grown.load(Relaxed) {
+            continue;
+        }
+        let mut made = r.host.made.lock().unwrap_or_else(|e| e.into_inner());
+        let Some((host, _)) = made.as_ref() else {
+            continue;
+        };
+        if !crate::pool::block_of(&host.texture).is_some_and(|(b, _)| draining.get(b).copied().unwrap_or(false))
+            || crate::texture::host_wrote(at)
+        {
+            continue;
+        }
+        let n = host.bytes;
+        // Under the lock, as in `want_level`.
+        crate::texture::unstage(at as This);
+        r.host.grown.store(true, Relaxed);
+        if let Some(old) = made.take() {
+            REPLACED.lock().unwrap_or_else(|e| e.into_inner()).push((crate::host::moment(), old));
+        }
+        crate::descriptor::host::moved(r.data() as u64);
+        moved += 1;
+        bytes += n;
+    }
+    if moved > 0 {
+        BLOCKS_FREED[1].fetch_add(moved, Relaxed);
+        tracing::debug!("{moved} host copies of textures moved out of draining blocks ({} MB)", bytes >> 20);
+    }
+    (0, 0)
+}
+
+/// Bytes of host copies [`free_blocks`] replaces at one look (once a
+/// second): each is read from title memory and uploaded again.
+#[cfg(windows)]
+const MOVE_BYTES: u64 = 96 << 20;
 
 /// For the memory line: the host copies the sweep never lets go
 /// ([`let_go_idle`] takes only copies of textures the title fills that the
