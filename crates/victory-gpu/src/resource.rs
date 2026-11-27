@@ -1711,6 +1711,17 @@ pub(crate) fn room(memory: Option<[u64; 4]>) -> bool {
     if filled < floor {
         return true;
     }
+    // The card's use as the system counts it, our blocks' empty room
+    // included, stays under [`hard_percent`] of the budget: in session play52
+    // the line below held textures at it while the blocks had 1.7 GB empty,
+    // and the card stood at 98.6 % (past the budget the system moves the
+    // card's memory into the PC's).
+    if let Some([budget, used, ..]) = memory
+        && budget != 0
+        && used >= budget / 100 * hard_percent()
+    {
+        return false;
+    }
     match memory {
         // What is kept for card copies of title buffers not made yet
         // (`crate::shadow::card_room_kept`) and for the render targets a
@@ -1796,6 +1807,23 @@ fn targets_headroom() -> (u64, u64) {
 fn targets_kept(most: u64, targets: u64, peak: u64, world: u64, headroom: u64) -> u64 {
     let line = if headroom != 0 && peak >= world { most.min(targets + headroom) } else { most };
     line.saturating_sub(targets)
+}
+
+/// The share of the card's budget, in percent, at which [`room`] makes no
+/// more copies whatever room its blocks have: `VICTORY_CARD_HARD_PERCENT`
+/// (95; 50 to 100, 100: none but the budget itself). Replayed over sessions
+/// play50 to play52 (`sim-room.ps1 -HardPercent`), it turns the queue down
+/// where the card stood past it: 50 of play50's 302 samples (which reached
+/// 108.8 %), 4 of play51's 115.
+#[cfg(windows)]
+fn hard_percent() -> u64 {
+    static PERCENT: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
+    *PERCENT.get_or_init(|| {
+        std::env::var("VICTORY_CARD_HARD_PERCENT")
+            .ok()
+            .and_then(|v| v.trim().parse::<u64>().ok())
+            .map_or(95, |percent| percent.clamp(50, 100))
+    })
 }
 
 /// [`room`] as it was at most a tenth of a second ago, for a question
@@ -2233,7 +2261,7 @@ fn free_blocks_on() -> bool {
 
 /// While the card's memory in use, as the system counts it, is over 92 %
 /// of its budget: the emptiest blocks of textures ([`crate::pool`], under
-/// two fifths held) are drained ([`crate::pool::drain`]: no new piece is
+/// [`sparse_percent`] held) are drained ([`crate::pool::drain`]: no new piece is
 /// cut from them) until what they would give back meets 88 %, at most 8
 /// more at a look; and up to [`MOVE_BYTES`] of the host copies in draining
 /// blocks are replaced, as [`want_level`] replaces one: the next use makes
@@ -2272,7 +2300,9 @@ fn free_blocks(
         let mut sparse: Vec<(u64, usize)> = blocks
             .iter()
             .enumerate()
-            .filter_map(|(i, b)| b.filter(|&(held, d)| !d && held > 0 && held * 5 < size * 2).map(|(held, _)| (held, i)))
+            .filter_map(|(i, b)| {
+                b.filter(|&(held, d)| !d && held > 0 && held * 100 < size * sparse_percent()).map(|(held, _)| (held, i))
+            })
             .collect();
         sparse.sort_unstable();
         let mut chosen = Vec::new();
@@ -2325,6 +2355,22 @@ fn free_blocks(
         tracing::debug!("{moved} host copies of textures moved out of draining blocks ({} MB)", bytes >> 20);
     }
     (0, 0)
+}
+
+/// How full, in percent, a block of textures may be and still be drained by
+/// [`free_blocks`] (the emptiest first): `VICTORY_DRAIN_PERCENT` (75; 10 to
+/// 95; 40 as before). In session play52 the blocks held 8.1 GB in 9.8: the
+/// 1.7 GB of room was some 11 MB in most of 154 blocks of 64 MiB, so few
+/// were under two fifths held and the card stood at 98.6 % of its budget.
+#[cfg(windows)]
+fn sparse_percent() -> u64 {
+    static PERCENT: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
+    *PERCENT.get_or_init(|| {
+        std::env::var("VICTORY_DRAIN_PERCENT")
+            .ok()
+            .and_then(|v| v.trim().parse::<u64>().ok())
+            .map_or(75, |percent| percent.clamp(10, 95))
+    })
 }
 
 /// Bytes of host copies [`free_blocks`] replaces at one look (once a
