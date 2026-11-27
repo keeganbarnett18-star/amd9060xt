@@ -2134,6 +2134,9 @@ pub(crate) fn let_go_idle() {
         }
         _ => (crate::host::vram_idle_ms(memory), u64::MAX),
     };
+    // What went lately counts as gone already, and one look lets go of
+    // [`SWEEP_STEP`] at most ([`sweep_owed`]).
+    let most = sweep_owed(most, crate::host::now_ms());
     // For the trail (`crate::host::trail`): how many went, their bytes,
     // and the first one.
     let (mut went, mut bytes, mut first) = (0u64, 0u64, None);
@@ -2218,6 +2221,9 @@ pub(crate) fn let_go_idle() {
             }
         }
     }
+    if most != u64::MAX && bytes > 0 {
+        sweep_went(bytes, crate::host::now_ms());
+    }
     // Over the card's budget as the system counts it: blocks of textures
     // whose every piece is idle are emptied whole, so the blocks go back.
     let (freed, freed_bytes) = free_blocks(&all, memory, &mut |at| let_go(at, BLOCK_IDLE_MS));
@@ -2235,6 +2241,71 @@ pub(crate) fn let_go_idle() {
             )
         });
     }
+}
+
+/// The most one look of [`let_go_idle`] lets go of under a limit: 256 MiB
+/// (`VICTORY_SWEEP_STEP_MB`; 0: no step, as before).
+#[cfg(windows)]
+fn sweep_step() -> u64 {
+    static STEP: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
+    *STEP.get_or_init(|| {
+        std::env::var("VICTORY_SWEEP_STEP_MB").ok().and_then(|v| v.trim().parse::<u64>().ok()).map_or(256 << 20, |mb| mb << 20)
+    })
+}
+
+/// How long what a look let go of counts as gone already: 1,000 ms
+/// (`VICTORY_SWEEP_SETTLE_MS`; 0: not at all, as before).
+#[cfg(windows)]
+fn sweep_settle_ms() -> u64 {
+    static MS: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
+    *MS.get_or_init(|| std::env::var("VICTORY_SWEEP_SETTLE_MS").ok().and_then(|v| v.trim().parse().ok()).unwrap_or(1000))
+}
+
+/// Bytes let go under a limit, by the time (ms) they went.
+#[cfg(windows)]
+static SWEPT_LATELY: std::sync::Mutex<std::collections::VecDeque<(u64, u64)>> = std::sync::Mutex::new(std::collections::VecDeque::new());
+
+/// Notes `bytes` let go at `now_ms` under a limit.
+#[cfg(windows)]
+fn sweep_went(bytes: u64, now_ms: u64) {
+    SWEPT_LATELY.lock().unwrap_or_else(|e| e.into_inner()).push_back((now_ms, bytes));
+}
+
+/// What a look of [`let_go_idle`] still has to let go of, of the `most`
+/// its rule asks: less what looks let go of in the last
+/// [`sweep_settle_ms`], and no more than [`sweep_step`].
+///
+/// The card's memory in use, as the system counts it and as the blocks'
+/// held bytes say, comes down only when a copy let go is dropped, after the
+/// submissions running then have finished (`crate::host::retire`, the
+/// piece's `HELD` at its last reference): a frame or more. The sweep looks
+/// before every submission, several a frame, and each found the card as
+/// full as before and let go of the whole of what its rule asked again. In
+/// session play52 103,580 copies went in 13 minutes (280 a second at
+/// times), and 26,227 were made and uploaded again: close objects were
+/// seen with their coarse levels as they came back, and copying the title's
+/// memory took 15.5 ms of a frame against 12.6.
+#[cfg(windows)]
+fn sweep_owed(most: u64, now_ms: u64) -> u64 {
+    if most == u64::MAX {
+        return most;
+    }
+    let settle = sweep_settle_ms();
+    let mut lately = SWEPT_LATELY.lock().unwrap_or_else(|e| e.into_inner());
+    while lately.front().is_some_and(|&(at, _)| now_ms.saturating_sub(at) >= settle) {
+        lately.pop_front();
+    }
+    let gone: u64 = lately.iter().map(|&(_, b)| b).sum();
+    drop(lately);
+    owed(most, gone, sweep_step())
+}
+
+/// [`sweep_owed`]'s arithmetic: `most` less `gone`, at most `step` (0: no
+/// step).
+#[cfg(any(windows, test))]
+fn owed(most: u64, gone: u64, step: u64) -> u64 {
+    let left = most.saturating_sub(gone);
+    if step == 0 { left } else { left.min(step) }
 }
 
 /// Since the start: looks of [`let_go_idle`], their microseconds, and the
@@ -4780,6 +4851,22 @@ float4 lit() : SV_Target { return 1.0; }
         assert_eq!(texture_floor_bytes(Some(12 * GIB)), 2 * GIB);
         assert_eq!(texture_floor_bytes(Some(24 * GIB)), 2 * GIB);
         assert_eq!(texture_floor_bytes(Some(32 * GIB)), 2 * GIB);
+    }
+
+    /// A look of the sweep lets go of what its rule asks, less what went
+    /// lately, a step at most.
+    #[test]
+    fn the_sweep_counts_what_went_lately() {
+        const MB: u64 = 1 << 20;
+        let step = 256 * MB;
+        // The rule asks 500 MB, none went lately: one step.
+        assert_eq!(owed(500 * MB, 0, step), 256 * MB);
+        // The look before let go of 256 MB, not yet counted by the card: 244.
+        assert_eq!(owed(500 * MB, 256 * MB, step), 244 * MB);
+        // Two looks before let go of all of it: nothing.
+        assert_eq!(owed(500 * MB, 512 * MB, step), 0);
+        // No step: all that is left.
+        assert_eq!(owed(500 * MB, 100 * MB, 0), 400 * MB);
     }
 
     /// The whole reserve until the world is in, then a headroom above what
