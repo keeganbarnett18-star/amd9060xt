@@ -145,7 +145,19 @@ fn packed() -> bool {
 }
 
 /// Whether a block of textures holds pieces of one size class only
-/// ([`class_of`]; `VICTORY_TEXTURE_CLASSES=0`: of any size, as before).
+/// ([`class_of`]): `VICTORY_TEXTURE_CLASSES=1`; off unless set, of any size
+/// as before.
+///
+/// Off by default since session play56, the first played with it: 163
+/// blocks (10.4 GB) held 7.1 GB, more air than any session before (small 35
+/// blocks three quarters held, medium 98 two thirds, large 28 two thirds),
+/// and the device was lost after two and a half minutes of the world (the
+/// invalid call known from play43 and test48, with no sign that the classes
+/// had a part in it, but nothing to show they had none). The air there was
+/// not theirs to use: the card stood at 99.7 % of its budget as the system
+/// counts it, `crate::resource::room` made no texture past 95 %, so nothing
+/// was cut from the holes at all. They are for once a texture that fits a
+/// hole is made whatever the card's count says.
 ///
 /// Mixed, the small textures fill the holes the large ones leave, and a
 /// hole so filled never grows back to a large texture's size: in sessions
@@ -157,7 +169,7 @@ fn packed() -> bool {
 /// plays a world's streaming against both.
 fn classes() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ON.get_or_init(|| std::env::var_os("VICTORY_TEXTURE_CLASSES").is_none_or(|v| v != "0"))
+    *ON.get_or_init(|| std::env::var_os("VICTORY_TEXTURE_CLASSES").is_some_and(|v| v == "1"))
 }
 
 /// The size class of a piece of `len` bytes, of a block of `size`: 1 under

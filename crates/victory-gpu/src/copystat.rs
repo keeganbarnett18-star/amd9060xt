@@ -811,7 +811,7 @@ fn log_memory() {
             crate::pool::GROWN[2].load(Relaxed)
         );
         tracing::info!(
-            "blocks of textures by the size of their pieces (VICTORY_TEXTURE_CLASSES=0: any size in any block), as (blocks, MB held): empty or of any size {:?}, under 1/128 of a block {:?}, under 1/16 {:?}, larger {:?}",
+            "blocks of textures by the size of their pieces (VICTORY_TEXTURE_CLASSES=1; unset: any size in any block, all counted as of any size), as (blocks, MB held): empty or of any size {:?}, under 1/128 of a block {:?}, under 1/16 {:?}, larger {:?}",
             crate::pool::texture_classes()[0],
             crate::pool::texture_classes()[1],
             crate::pool::texture_classes()[2],
