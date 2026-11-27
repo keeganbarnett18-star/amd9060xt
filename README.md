@@ -46,8 +46,9 @@ Played by hand into the open world (sessions play52 to play54, 27 November
   are drained under 40 % full again. In session play56 the card's rules then
   stopped each other: at 95 % of the budget no new texture is made, the sweep
   counts the room inside blocks (3.3 GB there) as free and lets nothing go,
-  and nothing new loads or unloads (7 to 17 fps). Making a texture that fits
-  a hole in a block, whatever the card's count says, is the next change.
+  and nothing new loads or unloads (7 to 17 fps). Past the ceiling a
+  texture that fits a hole in a block is now made, and no new block
+  (`VICTORY_TEXTURE_HOLES=0`: as before); it awaits a play session.
 - **System memory is tight on 32 GB, and the frame rate follows it.** The
   console has one memory; here a texture lies in the game's memory and again
   on the card. The game holds 29-30 GB in the open world. With 4-5 GB of the
