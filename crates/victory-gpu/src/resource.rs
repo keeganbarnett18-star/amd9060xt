@@ -1964,11 +1964,12 @@ impl Drop for ShortOfRoom {
 /// card copies of title buffers and for render targets), is under 97
 /// percent of its budget (`VICTORY_TEXTURE_SHORT_PERCENT` says another
 /// share, from [`room_percent`] to 98), and while its use as the system
-/// counts it is under [`room`]'s hard ceiling ([`hard_percent`], 95).
-/// The ceiling holds for these too: it is where the system begins to move
-/// the card's memory into the PC's (play52 stood at 98.6 %, play50 reached
-/// 108.8 %), and a copy without its largest levels still takes some of the
-/// card (a block-compressed 256 by 256 with its levels, some 87 KB).
+/// counts it is under a ceiling of their own ([`short_hard_percent`], 98),
+/// above [`room`]'s for whole copies ([`hard_percent`], 95): past the budget
+/// the system moves the card's memory into the PC's (play52 stood at
+/// 98.6 %, play50 reached 108.8 %), but a copy without its largest levels
+/// takes little of the card (a block-compressed 256 by 256 with its levels,
+/// some 87 KB), and at 95 % textures new to the scene were black.
 /// `VICTORY_TEXTURE_SHORT=0` makes none, as before; so does
 /// `VICTORY_TEXTURE_BUDGET_MB`, a limit of its own.
 #[cfg(windows)]
@@ -1990,7 +1991,31 @@ pub(crate) fn room_for_short(memory: Option<[u64; 4]>) -> bool {
     };
     let counted =
         used.saturating_sub(crate::pool::texture_room()) + crate::shadow::card_room_kept() + targets_room_kept();
-    under_short_line(budget, used, counted, percent, hard_percent())
+    under_short_line(budget, used, counted, percent, short_hard_percent())
+}
+
+/// The share of the card's budget, as the system counts its use, up to
+/// which copies made short of room ([`ShortOfRoom`]) are still made:
+/// `VICTORY_SHORT_HARD_PERCENT` (98; from [`hard_percent`] to 100).
+///
+/// At [`hard_percent`] itself (95) a texture new to the scene got no copy
+/// at all, short or whole, and was drawn black for as long as the card
+/// stayed there: session play53 stood at 95.8 to 95.9 % for minutes (the
+/// room in our blocks is the card's memory until a whole block empties),
+/// and a wall the player was painting stayed black. A short copy is small
+/// (a block-compressed 256 by 256 with its levels, some 87 KB; 6,053 of
+/// them held 358 MB in that session), so it is made up to 98 %, still under
+/// the budget past which the system moves the card's memory into the PC's.
+#[cfg(windows)]
+fn short_hard_percent() -> u64 {
+    static PERCENT: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
+    *PERCENT.get_or_init(|| {
+        std::env::var("VICTORY_SHORT_HARD_PERCENT")
+            .ok()
+            .and_then(|v| v.trim().parse::<u64>().ok())
+            .map_or(98, |p| p.clamp(hard_percent(), 100))
+            .max(hard_percent())
+    })
 }
 
 /// [`room_for_short`]'s rule: the card's `used` bytes (as the system counts

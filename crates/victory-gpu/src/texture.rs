@@ -1668,9 +1668,8 @@ pub(crate) fn aliased(at: u64, len: u64) -> bool {
 /// change of that only costs one upload more.
 pub(crate) fn fingerprint_texture(at: u64, len: u64) -> u64 {
     const WINDOW: usize = 64 << 10;
-    let most = full_print_bytes();
     let n = len as usize;
-    if n <= 48 << 10 || n > most || !aliased(at, len) {
+    if whole_print(at, len).is_none() {
         return fingerprint(at, len);
     }
     thread_local! {
@@ -1691,6 +1690,59 @@ pub(crate) fn fingerprint_texture(at: u64, len: u64) -> u64 {
     });
     let first = (print as u64 ^ (print >> 64) as u64).to_le_bytes();
     u64::from_le_bytes(first) | 1
+}
+
+/// The bytes [`fingerprint_texture`] reads whole for the texture at title
+/// memory `[at, at + len)`, if it does: one of more than 48 KiB, up to
+/// [`full_print_bytes`], whose pages are shown at other addresses too.
+pub(crate) fn whole_print(at: u64, len: u64) -> Option<u64> {
+    let n = len as usize;
+    (n > 48 << 10 && n <= full_print_bytes() && aliased(at, len)).then_some(len)
+}
+
+/// The bytes of whole reads ([`whole_print`]) the looks at uploaded
+/// textures may make in one frame: `VICTORY_FULL_PRINT_FRAME_KB` (8,192;
+/// 0: no limit, as Kitty6's ae3cce82). A look that would go past it waits
+/// for the next frame.
+///
+/// The reads go through the kernel (`crate::host::copy_mapped`,
+/// `ReadProcessMemory`, 64 KiB at a time), as do the submitting thread's
+/// questions to the write watch, and those waited on them: in session
+/// play53 the write watch took 15.3 ms of a frame at the median against 3.4
+/// in play52's same first minutes (p90 41 against 21), and frames swung
+/// between 43 and 98 ms, with every aliased texture on screen read whole
+/// every 30 frames.
+fn whole_prints_a_frame() -> u64 {
+    static KB: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
+    *KB.get_or_init(|| {
+        std::env::var("VICTORY_FULL_PRINT_FRAME_KB").ok().and_then(|v| v.trim().parse::<u64>().ok()).unwrap_or(8192) << 10
+    })
+}
+
+/// Takes `bytes` of [`whole_prints_a_frame`] for frame `frame`: false (and
+/// nothing taken) when they do not fit what is left of it. The first read
+/// of a frame always fits, so one texture larger than the budget is still
+/// looked at.
+pub(crate) fn take_whole_print(bytes: u64, frame: u64) -> bool {
+    use std::sync::atomic::{AtomicU64, Ordering::Relaxed};
+    static FRAME: AtomicU64 = AtomicU64::new(u64::MAX);
+    static SPENT: AtomicU64 = AtomicU64::new(0);
+    let most = whole_prints_a_frame();
+    if most == 0 {
+        return true;
+    }
+    if FRAME.swap(frame, Relaxed) != frame {
+        SPENT.store(0, Relaxed);
+    }
+    SPENT
+        .fetch_update(Relaxed, Relaxed, |spent| fits(spent, bytes, most).then_some(spent + bytes))
+        .is_ok()
+}
+
+/// [`take_whole_print`]'s rule: `bytes` more fit after `spent` of `most`,
+/// or nothing was spent yet.
+fn fits(spent: u64, bytes: u64, most: u64) -> bool {
+    spent == 0 || spent + bytes <= most
 }
 
 /// Whether a title texture has a staging buffer: a list recorded its
@@ -2083,6 +2135,20 @@ mod short_tests {
             drop(staging);
             super::unstage(resource);
         }
+    }
+}
+
+#[cfg(test)]
+mod whole_print_tests {
+    /// A frame's whole reads stop at the budget; the first always goes.
+    #[test]
+    fn whole_reads_fit_a_frame() {
+        const MB: u64 = 1 << 20;
+        assert!(super::fits(0, 4 * MB, 8 * MB));
+        assert!(super::fits(4 * MB, 4 * MB, 8 * MB));
+        assert!(!super::fits(6 * MB, 4 * MB, 8 * MB));
+        // One larger than the budget, first in its frame: looked at.
+        assert!(super::fits(0, 16 * MB, 8 * MB));
     }
 }
 

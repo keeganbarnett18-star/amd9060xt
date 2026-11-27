@@ -2740,6 +2740,14 @@ impl State {
             // was shown four frames late, over and over.
             let mut again_in = first_recheck();
             if let Some((at, len, print, looks, uploaded)) = host.texture_slot_checked(index) {
+                // A whole read past what a frame may make waits for the next
+                // frame (`crate::texture::take_whole_print`).
+                if let Some(bytes) = crate::texture::whole_print(at, len)
+                    && !crate::texture::take_whole_print(bytes, frame)
+                {
+                    host.texture_slot_recheck(index, write, frame + 1, (at, len), print, looks, uploaded);
+                    continue;
+                }
                 if crate::texture::fingerprint_texture(at, len) == print {
                     HEAP_TEXTURES_RECHECKED[0].fetch_add(1, Ordering::Relaxed);
                     match RECHECK_FRAMES.get(usize::from(looks) + 1) {
