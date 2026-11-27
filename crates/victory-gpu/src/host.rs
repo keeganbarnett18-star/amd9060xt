@@ -1887,6 +1887,16 @@ const SCRATCH_FIRST: u64 = 256 << 10;
 const SPARE_MOST: u64 = 128 << 20;
 /// The same with [`keep_freed`].
 const SPARE_KEPT: u64 = 1 << 30;
+/// The same with [`keep_freed`] on a PC of 32 GiB or less
+/// (`crate::residency::limited_host_ram`). It was [`SPARE_MOST`] there: in
+/// session play55 (never short of memory, 5 to 6 GB free) the lists held
+/// 96 to 256 chunks (141 to 294 MB) from one look to the next while the
+/// world streamed, the spare ones stood at 128 MB, and what the lists gave
+/// back past that was freed and made again: 250 to 400 upload buffers a
+/// second, 400 MB a second mapped and zeroed (30,000 to 60,000 page faults
+/// a second with the page file unchanged). Under pressure the unused ones
+/// go ([`trim_spare_chunks`]).
+const SPARE_LIMITED: u64 = 384 << 20;
 
 /// Whether lists share their scratch chunks: a list takes a chunk when it
 /// first needs one, a small one first, and gives all of them back when it
@@ -1970,6 +1980,16 @@ fn take_chunk(host: &Host, size: u64) -> Option<Chunk> {
     })
 }
 
+/// The most bytes of spare scratch chunks kept: with memory kept
+/// ([`keep_freed`]) 1 GiB, or 384 MiB on a PC short of it; else 128 MiB.
+fn spare_limit(keep: bool, limited: bool) -> u64 {
+    match (keep, limited) {
+        (true, false) => SPARE_KEPT,
+        (true, true) => SPARE_LIMITED,
+        (false, _) => SPARE_MOST,
+    }
+}
+
 /// A list is done with `chunks` (it was reset after its submissions ran,
 /// or dropped): kept for the next list, or freed past [`SPARE_MOST`] and
 /// without the pool.
@@ -1982,12 +2002,7 @@ fn give_chunks(chunks: Vec<(Chunk, u64)>) {
         let mut spare = SPARE.lock().unwrap_or_else(|e| e.into_inner());
         for (chunk, size) in chunks {
             let back = if scratch_pool() {
-                let limit = if keep_freed() && !crate::residency::limited_host_ram() {
-                    SPARE_KEPT
-                } else {
-                    SPARE_MOST
-                };
-                spare.give(chunk, size, limit)
+                spare.give(chunk, size, spare_limit(keep_freed(), crate::residency::limited_host_ram()))
             } else {
                 Some(chunk)
             };
@@ -10287,6 +10302,17 @@ mod spare {
         assert_eq!(spare.take(1), Some(2));
         assert_eq!(spare.bytes, 0);
         assert!(spare.kept.is_empty());
+    }
+
+    /// A PC short of memory keeps more spare chunks than a play's lists
+    /// hold at once (294 MB in session play55), not the least.
+    #[test]
+    fn a_pc_short_of_memory_keeps_what_a_plays_lists_hold() {
+        assert_eq!(super::spare_limit(true, false), 1 << 30);
+        assert_eq!(super::spare_limit(true, true), 384 << 20);
+        assert!(super::spare_limit(true, true) > 294 << 20);
+        assert_eq!(super::spare_limit(false, true), 128 << 20);
+        assert_eq!(super::spare_limit(false, false), 128 << 20);
     }
 
     /// A look takes away only what stayed untaken from the look before to
