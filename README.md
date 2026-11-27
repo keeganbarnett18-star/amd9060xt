@@ -34,6 +34,8 @@ Played by hand into the open world (sessions play52 to play54, 27 November
 | play52 | 18.5 | pop-in, some black textures |
 | play53 | 15 (1 in 10 frames under 6.5) | sharper textures early; once the open world loads, textures cycle between their coarse and full copies, one black wall |
 | play54 | 5 to 8 in stretches | lighting better, no bad textures, frames slow |
+| play59 | 23.6 (1 in 10 frames under 17.5), driving | the page pool read in place: smaller hitches, steadier; picture still soft (textures wait for room on the card) |
+| play60 | 12.0 (1 in 10 under 5.6), driving | the same build with the page pool off, for comparison |
 
 ### Known issues
 
@@ -70,6 +72,14 @@ Played by hand into the open world (sessions play52 to play54, 27 November
 - **One crash** ("device removed: invalid call") while descriptor views are
   being made, seen three times now, the last after two and a half minutes in
   the open world (play56); its cause is not found yet.
+- **With the page pool in place, the card's memory is shorter.** All six pool
+  sections (6 GB) are opened as heaps to place 332 MB. Most windows span
+  pages from all over the pool and keep a copy. Session play59 logged 16
+  "not enough memory" failures for shared or upload buffers, and more
+  textures went into holes in blocks. Placing more of the pool, or opening
+  less of it, is the next step.
+- **The frame recorder crashes at start** (`VICTORY_RECORD`). Its device hook
+  writes into a read-only page of the Agility SDK 1.620 runtime.
 - The game runs in a window, not fullscreen.
 
 ## Roadmap
@@ -89,9 +99,11 @@ The memory work in detail, kept up to date as it goes:
    game changes has to be tracked and copied. Driving is where it shows: while
    the world streams in, the game remaps its memory constantly and frames drop
    to 10-20 fps (session play58 proved the remapping, not our copying, is the
-   wait). Next: the card reads the game's memory where it lies instead of
-   through copies (about 3.4 GB of RAM less and far less to track), textures
-   moved on the card instead of through RAM, and fewer memory calls a frame.
+   wait). Started: the card reads the game's page pool where it lies instead
+   of through copies. Driving went from 12 to 23.6 fps median, with 3 GB
+   less RAM; so far only 332 MB of about 3 GB is covered. Next: cover the
+   rest, textures moved on the card instead of through RAM, and fewer memory
+   calls a frame.
    Then: the card's memory kept
    with room to spare in the open world, so textures no longer go blurry, black
    or stale as a session goes on and frames stay even; lighting without rays
@@ -122,6 +134,12 @@ and in `docs/findings.md`.
   `ID3D12Device13` (the system's own runtime on this PC did not), and
   `VICTORY_INPLACE=1` opens windows of title memory as heaps. About 3 GB less
   RAM, smaller hitches, same frame rate.
+- **The game's page pool read and written in place with late wait on**
+  (`VICTORY_POOL_IN_PLACE=1`, set by the launcher). What shaders write there is
+  held as in flight until the card has run it, so nothing reads it early.
+  Before this, the pool was never placed while late wait was on. In driving
+  (play59 against play60): 23.6 fps median against 12.0, 30 ms of preparing
+  a frame against 81, and 3 GB less private memory.
 - **Texture uploads are recorded right before the list that needs them**
   (ported from Belobug's fork): a texture the game changed no longer shows its
   old or empty contents for a frame.

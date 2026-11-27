@@ -34,6 +34,30 @@ Last updated 2026-11-27, after session play56. The sections further down are old
 - **play58 result (done, switch already set back to 1):** the user found driving worse with `VICTORY_TEXTURE_NO_WAIT=0`. The log shows texture refreshes spending 7 → 34 → 93 → 180 ms a frame waiting for the runtime's remapping as driving went on, at 11–14 fps. **Conclusion: the bottleneck while streaming is the runtime remapping title memory (the page pool's views); the kernel reads under `NO_WAIT=1` are the cheaper way around it, not the cause.** Step 2 (pool in place) and anything that remaps less often are what can help driving. The log is `trace-log-play58-nowait0.txt` once the game closes, or `trace-log.txt` if it was not copied.
 - The test as it was planned, for reference: `F:\gta6xbox\trace-crash.cmd` set `VICTORY_TEXTURE_NO_WAIT=0` (it was 1). Purpose: driving is close to unplayable while the world streams; in play57 the heavy-streaming moments had 68 textures a frame read through the kernel and 88 ms of frame prep, against 3–7 and 33–40 ms in normal play. Expectation: probably worse. `texture.rs` `no_wait` documents that waiting for the runtime's remap lock gave 0.3–3.7 s frames in runs 99–101. Either result says whether the runtime's remapping during streaming is the bottleneck. **Put it back to 1 after the test.**
 
+- **play59 / play60: step 2, page pool in place (commit 30314070).**
+  - Both sessions ran the same build, with similar driving after a fresh restart. The only difference: play59 had `VICTORY_POOL_IN_PLACE=1`, play60 had it off. Logs: `trace-log-play59.txt` and `trace-log.txt` → play60; `mem-play59.csv` and `mem-play60.csv`. Figures below are in-world samples, play59 vs play60:
+
+    | | play59 (pool on) | play60 (pool off) | play57 |
+    |---|---|---|---|
+    | Median fps | 23.6 | 12.0 | 18.6 |
+    | p10 fps | 17.5 | 5.6 | 8.2 |
+    | Preparing a frame | 30 ms | 81 ms | 49 ms |
+    | Refreshes | 6.1 ms | 23.4 ms | 11.5 ms |
+    | Write watch | 2.0 ms | 16.5 ms | 5.9 ms |
+    | Private memory | 26.8 GB | 29.9 GB | 28.5 GB |
+    | Free RAM at the end | 6.1 GB | 2.2 GB | 5.4 GB |
+
+  - The user found play59 more stable.
+  - Settles caused by the new rule: 0. Declared in-place writes: 0 ranges, so the card did not write the placed memory in these runs.
+  - **Coverage is small.** 76 buffers/windows placed (332 MB), and 74 let go because the runtime remapped their memory. 1,554 windows were turned down as "not one run of a committed section": they span scattered pool pages. Window copies still came to 2.4 GB.
+  - **Cost:** all six pool sections (6,144 MB) are opened as heaps. play59 logged 16 "not enough memory" failures (no shared / upload / read-back buffer; play57/58: 0), and 183,480 slots made from holes (play60: 52,639). The picture still looks soft: on average 30,000 textures picked by index wait (play60: 52,000), and about 800 draws a frame are dropped (play57: 912, play60: 1,176). The drops are not new.
+  - My theory during play59 was that the opened sections cause the drops. The A/B showed it wrong for the drops; it may still hold for the 16 memory failures.
+  - The frame recorder (`VICTORY_RECORD`) crashes at start: its device hook writes into a read-only page of D3D12Core.dll 1.620 (`trace-log-play59-recorder-crash.txt`). It is off in `trace-crash.cmd`.
+  - **Next for step 2:**
+    1. Place scattered windows: each view range could be its own placed buffer, or sections opened per range.
+    2. Find why opening sections costs budget, and whether opening fewer helps.
+    3. Find the cause of the 16 allocation failures.
+
 **PC setup for the tests:** other programs (chat, browser, game launcher, live wallpaper) were closed before sessions; that also raised the card's video budget from 14.58 to 15.24 GB.
 
 **What the next session must show (play at least 5–10 minutes in the open world):**

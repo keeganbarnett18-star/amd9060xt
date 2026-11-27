@@ -68,6 +68,12 @@ The layer can open the game's memory as a GPU heap so the card reads it in place
 - Cost to know: the whole pool section (6.2 GB) is charged to commit when made. The page file is 64 GB here, so that is fine.
 - **How to verify:** the log line "title memory in place: N windows M MB" should rise from ~370 MB toward 3 GB, "host copies of title memory" should fall, and private bytes should fall by about the same.
 
+**Status (2026-11-27, commit 30314070, played as play59 against play60):**
+- Done: pool-in-place and late wait together. Shader writes through memory in place are declared and kept in the air (`take_in_place` in host.rs). The launcher turns the pool on.
+- Result: driving at 23.6 fps median against 12.0 with it off, and 3 GB less private memory.
+- Only 332 MB is placed so far. Windows spanning scattered pool pages keep a copy (2.4 GB of them). The six sections (6 GB) are opened as heaps, and play59 had 16 buffer allocation failures.
+- Next: place the scattered windows, and open less.
+
 This is the largest RAM saving left, and it also removes refresh copies from every frame, which helps the CPU round that comes next. It is also the riskiest: wrong reads show as flickering geometry. Use the frame replay (`docs/replay.md`) to compare frames before asking the user to play.
 
 ## Step 3: waste less of the card
