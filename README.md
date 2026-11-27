@@ -42,13 +42,17 @@ Played by hand into the open world (sessions play52 to play54, 27 November
   which comes back later as pop-in. In play53 and play54 the packing of texture
   blocks also never stopped (20,100 copies moved in 16 minutes against 2,186
   in play52). Each move goes through the kernel, and the write tracking of the
-  console's shared memory went from about 3 ms to 30-47 ms a frame. The
-  play-test launcher drains only blocks under 40 % full again
-  (`VICTORY_DRAIN_PERCENT=40`, untested yet); smaller blocks, a lower ceiling
-  with room to spare, and letting go of the textures unused the longest come
-  next.
-- **System memory is tight on 32 GB.** The game holds 26-29 GB, and free
-  memory fell to 2 GB at times in play54. Close other programs.
+  console's shared memory went from about 3 ms to 30-47 ms a frame. Blocks
+  are drained under 40 % full again, and a block now holds textures of one
+  size class, so that the room inside blocks (1.7 to 2 GB of the card) can be
+  used; both await a play session.
+- **System memory is tight on 32 GB, and the frame rate follows it.** The
+  console has one memory; here a texture lies in the game's memory and again
+  on the card. The game holds 29-30 GB in the open world. With 4-5 GB of the
+  PC's memory free a frame takes 23 ms to prepare; with 1-3 GB free, 40-100
+  ms, as Windows moves the game's memory to the page file and back. Close
+  other programs before playing (a browser, Discord, Steam and a live
+  wallpaper held some 4 GB here), and keep the page file on an SSD.
 - **Dips in busy areas and while new areas load.** The processor is the limit
   (about 9 cores' worth of work); new areas also bring shaders seen for the
   first time, which take up to a second each to build. A second visit is
@@ -117,6 +121,11 @@ and in `docs/findings.md`.
 - **The card's room kept during long play**: an early idle band from 82 %, a
   sweep that counts what it let go in the last second and lets go of 256 MB at
   most a look, and a fixed headroom for render targets once the world is in.
+- **Less churn when the PC's memory is short**: spare upload chunks are freed
+  only when unused (they were freed and made again 60 to 100 times a second
+  for as long as memory was short), and texture blocks hold one size class
+  each (in a played-out simulation, 2.6 GB of blocks for 2 GB of textures
+  against 3.3 GB mixed).
 - **Textures painted through another view of their pages** are read whole and
   looked at again every 30 frames (from Kitty6), within a budget of 8 MB a
   frame.
