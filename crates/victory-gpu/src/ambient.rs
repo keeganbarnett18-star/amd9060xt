@@ -30,7 +30,7 @@
 //!
 //! `VICTORY_AMBIENT_SHADE=<strength>,<radius in metres>` sets the creases.
 //! `VICTORY_AMBIENT_MOST=<level>` is the estimate's ceiling, in the
-//! constant's units.
+//! constant's units; `VICTORY_AMBIENT_LEAST=<level>` its floor.
 //!
 //! The air of a room is lit by the same probes: without rays they hold the
 //! sky's light indoors too, a brown veil at sunset. `VICTORY_AMBIENT_AIR`
@@ -129,6 +129,19 @@ fn ceiling() -> f32 {
     })
 }
 
+/// The darkest the estimate makes the light, in the constant's units
+/// (`VICTORY_AMBIENT_LEAST=<level>`; unset or 0: no floor). The estimate
+/// alone left shade outdoors in the day all but black (session play51, the
+/// street corner at 1:39): the cells it averages hold less light than the
+/// constant's units suppose.
+fn least() -> f32 {
+    static SET: OnceLock<f32> = OnceLock::new();
+    *SET.get_or_init(|| {
+        let set = std::env::var("VICTORY_AMBIENT_LEAST").unwrap_or_default();
+        set.trim().parse().ok().filter(|v: &f32| v.is_finite() && *v > 0.0).unwrap_or(0.0)
+    })
+}
+
 /// Strength and radius of the creases' shade.
 fn shade() -> [f32; 2] {
     static SET: OnceLock<[f32; 2]> = OnceLock::new();
@@ -145,7 +158,7 @@ fn shade() -> [f32; 2] {
 }
 
 const SOURCE: &str = r#"
-#define RS "RootConstants(num32BitConstants=12, b0), DescriptorTable(SRV(t0)), DescriptorTable(UAV(u0)), UAV(u1), UAV(u2)"
+#define RS "RootConstants(num32BitConstants=13, b0), DescriptorTable(SRV(t0)), DescriptorTable(UAV(u0)), UAV(u1), UAV(u2)"
 #define CX 64
 #define CY 36
 #define CELLS (CX * CY)
@@ -155,6 +168,7 @@ cbuffer Set : register(b0) {
     float level; float constant; float strength; float radius;
     float near; float tan_y; uint width; uint height;
     float follow; float most; float air; float ceiling;
+    float floor_;
 };
 Texture2D<float> depth : register(t0);
 // Cells: the light they send out (then, at CELLS, the slow mean), from
@@ -343,6 +357,11 @@ void raise(uint3 at : SV_DispatchThreadID) {
     // doorway filling the view raises the cells, not the room past it.
     float lum = dot(found, LUMA);
     if (ceiling > 0.0 && lum > ceiling * open) found *= ceiling * open / lum;
+    // No darker than the floor (`VICTORY_AMBIENT_LEAST`): shade outdoors in
+    // the day was all but black with the estimate alone (session play51);
+    // what is missing is made up in the constant's tint.
+    lum = dot(found, LUMA);
+    if (floor_ > 0.0 && lum < floor_ * open) found += float3(1.0, 0.98, 0.94) * (floor_ * open - lum);
     float3 was = unpack(light[p]);
     // What the program left counts as far as it can be true: the sky's light
     // outdoors, not the blocks of other memory.
@@ -387,7 +406,7 @@ fn make(device: &ID3D12Device, buffer: impl Fn(u64) -> Option<ID3D12Resource>) -
                 root = Some(crate::rootsig::make(
                     device,
                     &[
-                        Param::Constants { register: 0, count: 12 },
+                        Param::Constants { register: 0, count: 13 },
                         Param::SrvTable { register: 0, count: 1, visibility: D3D12_SHADER_VISIBILITY_ALL },
                         Param::UavTable { register: 0, count: 1 },
                         Param::Uav(1),
@@ -469,10 +488,15 @@ pub(crate) fn after(list: &HostList, role: Role, views: &Views) -> bool {
         Set::Estimate(level) => (level, 0.0f32),
         Set::Constant(level) => (0.0, level),
     };
-    if role != Role::Radiance && constant == 0.0 && !KEPT.load(Ordering::Relaxed) {
+    // The air is bounded by what the estimate gathers, so it waits for a
+    // kept frame with the constant too.
+    if role != Role::Radiance && (constant == 0.0 || role == Role::Air) && !KEPT.load(Ordering::Relaxed) {
         return false;
     }
-    if role == Role::Air && (constant > 0.0 || air() == 0.0) {
+    // With the constant the air is bounded as well (`VICTORY_AMBIENT_AIR`):
+    // without it the haze kept the probes' sky light and other memory and
+    // changed from frame to frame (session play50, the camp).
+    if role == Role::Air && air() == 0.0 {
         return false;
     }
     static SAID: Mutex<u32> = Mutex::new(0);
@@ -487,7 +511,7 @@ pub(crate) fn after(list: &HostList, role: Role, views: &Views) -> bool {
     list.keep(&pass.points);
     let [strength, radius] = shade();
     let floats = [level, constant, strength, radius, 0.1, 0.45];
-    let mut words = [0u32; 12];
+    let mut words = [0u32; 13];
     for (to, v) in words.iter_mut().zip(floats) {
         *to = v.to_bits();
     }
@@ -497,6 +521,7 @@ pub(crate) fn after(list: &HostList, role: Role, views: &Views) -> bool {
     words[9] = 4.0f32.to_bits();
     words[10] = air().to_bits();
     words[11] = ceiling().to_bits();
+    words[12] = least().to_bits();
     let l = &list.list;
     // SAFETY: an open list with the heap of the views set; the title's
     // program has just used both views, so their textures are in the states
@@ -504,7 +529,7 @@ pub(crate) fn after(list: &HostList, role: Role, views: &Views) -> bool {
     unsafe {
         uav_barrier(l);
         l.SetComputeRootSignature(&pass.root);
-        l.SetComputeRoot32BitConstants(0, 12, words.as_ptr().cast(), 0);
+        l.SetComputeRoot32BitConstants(0, 13, words.as_ptr().cast(), 0);
         l.SetComputeRootDescriptorTable(1, views.depth);
         l.SetComputeRootDescriptorTable(2, views.image);
         l.SetComputeRootUnorderedAccessView(3, pass.cells.GetGPUVirtualAddress());
@@ -522,7 +547,8 @@ pub(crate) fn after(list: &HostList, role: Role, views: &Views) -> bool {
             }
             Role::Air => run(&pass.air, views.size[0].div_ceil(8), views.size[1].div_ceil(8), views.slices.div_ceil(2)),
             Role::Resolve => {
-                if constant == 0.0 {
+                // (The air's bound reads the points with the constant too.)
+                if constant == 0.0 || air() > 0.0 {
                     run(&pass.place, 8, 9, 1);
                     run(&pass.gather, 20, 45, 1);
                 }
