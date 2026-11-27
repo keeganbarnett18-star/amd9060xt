@@ -1904,18 +1904,21 @@ fn scratch_pool() -> bool {
 /// Things of some sizes that nothing holds now, kept for whoever next asks
 /// for one of the same size.
 struct Spare<T> {
-    kept: Vec<(T, u64)>,
+    /// Each with its bytes and the look ([`Spare::unused`]) it was given in.
+    kept: Vec<(T, u64, u64)>,
     bytes: u64,
+    /// The number of looks so far.
+    look: u64,
 }
 
 impl<T> Spare<T> {
     const fn new() -> Self {
-        Spare { kept: Vec::new(), bytes: 0 }
+        Spare { kept: Vec::new(), bytes: 0, look: 0 }
     }
 
     /// A kept thing of `size` bytes, the one given last.
     fn take(&mut self, size: u64) -> Option<T> {
-        let at = self.kept.iter().rposition(|(_, s)| *s == size)?;
+        let at = self.kept.iter().rposition(|(_, s, _)| *s == size)?;
         self.bytes -= size;
         Some(self.kept.remove(at).0)
     }
@@ -1927,8 +1930,20 @@ impl<T> Spare<T> {
             return Some(thing);
         }
         self.bytes += size;
-        self.kept.push((thing, size));
+        self.kept.push((thing, size, self.look));
         None
+    }
+
+    /// A look: the kept things nothing took since the look before this one
+    /// (the last given is taken first, so those were not needed between two
+    /// looks), each with its bytes. They are kept no more.
+    fn unused(&mut self) -> Vec<(T, u64)> {
+        let look = self.look;
+        self.look += 1;
+        let (gone, kept): (Vec<_>, Vec<_>) = std::mem::take(&mut self.kept).into_iter().partition(|(_, _, given)| *given < look);
+        self.kept = kept;
+        self.bytes -= gone.iter().map(|(_, size, _)| *size).sum::<u64>();
+        gone.into_iter().map(|(thing, size, _)| (thing, size)).collect()
     }
 }
 
@@ -1993,16 +2008,27 @@ fn give_chunks(chunks: Vec<(Chunk, u64)>) {
     drop(freed);
 }
 
-/// Drops spare scratch chunks kept idle when host memory is pressured.
+/// While host memory is pressured, once a second: drops the spare scratch
+/// chunks no list took since the look before ([`Spare::unused`]).
+///
+/// It dropped all of them each time. The lists of the next frame then made
+/// theirs anew, and a PC of 32 GB stays pressured for the whole of a play in
+/// the open world (3 GiB free or less; sessions play50 to play54): 60 to 100
+/// upload buffers a second made, mapped, zeroed and freed for as long as
+/// the pressure lasted, and none in the minutes it had cleared (play50,
+/// 08:04 to 08:10), each a change of the address space that the write
+/// watch's askings and the guards' protections wait behind.
 fn trim_spare_chunks() {
     let freed: Vec<(Chunk, u64)> = {
         let mut spare = SPARE.lock().unwrap_or_else(|e| e.into_inner());
         if spare.kept.is_empty() {
             return;
         }
-        spare.bytes = 0;
-        std::mem::take(&mut spare.kept)
+        spare.unused()
     };
+    if freed.is_empty() {
+        return;
+    }
     let count = freed.len() as u64;
     let bytes: u64 = freed.iter().map(|(_, s)| *s).sum();
     ALIVE[1].fetch_sub(count, Ordering::Relaxed);
@@ -10261,6 +10287,29 @@ mod spare {
         assert_eq!(spare.take(1), Some(2));
         assert_eq!(spare.bytes, 0);
         assert!(spare.kept.is_empty());
+    }
+
+    /// A look takes away only what stayed untaken from the look before to
+    /// this one: what is in use between two looks stays.
+    #[test]
+    fn a_look_takes_only_what_nothing_took_since_the_look_before() {
+        let mut spare: Spare<u32> = Spare::new();
+        assert_eq!(spare.give(1, 4, 100), None);
+        assert_eq!(spare.give(2, 4, 100), None);
+        // Given since the last look: both stay.
+        assert!(spare.unused().is_empty());
+        // One is taken and given back, as a list does each frame: it stays,
+        // the other was not needed.
+        assert_eq!(spare.take(4), Some(2));
+        assert_eq!(spare.give(2, 4, 100), None);
+        assert_eq!(spare.unused(), vec![(1, 4)]);
+        assert_eq!(spare.bytes, 4);
+        // Still in use between the looks.
+        assert_eq!(spare.take(4), Some(2));
+        assert_eq!(spare.give(2, 4, 100), None);
+        assert!(spare.unused().is_empty());
+        // Not any more.
+        assert!(spare.unused().len() == 1 && spare.bytes == 0 && spare.kept.is_empty());
     }
 }
 

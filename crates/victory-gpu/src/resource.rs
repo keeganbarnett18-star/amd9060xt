@@ -2759,10 +2759,16 @@ fn free_blocks(
 }
 
 /// How full, in percent, a block of textures may be and still be drained by
-/// [`free_blocks`] (the emptiest first): `VICTORY_DRAIN_PERCENT` (75; 10 to
-/// 95; 40 as before). In session play52 the blocks held 8.1 GB in 9.8: the
-/// 1.7 GB of room was some 11 MB in most of 154 blocks of 64 MiB, so few
-/// were under two fifths held and the card stood at 98.6 % of its budget.
+/// [`free_blocks`] (the emptiest first): `VICTORY_DRAIN_PERCENT` (40; 10 to
+/// 95). In session play52 the blocks held 8.1 GB in 9.8: the 1.7 GB of room
+/// was some 11 MB in most of 154 blocks of 64 MiB, so few were under two
+/// fifths held and the card stood at 98.6 % of its budget. It was 75 for
+/// sessions play53 and play54: blocks that full hold 26 to 48 MB each, all
+/// of it read from title memory and uploaded again when the block is
+/// drained, and the card stayed over 92 % all the same, so the draining
+/// never stopped: 20,100 host copies moved in 16 minutes against 2,186 in
+/// 13, on a PC whose memory was short (2 to 3 GB free), where reading title
+/// memory again brings its pages back from the page file.
 #[cfg(windows)]
 fn sparse_percent() -> u64 {
     static PERCENT: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
@@ -2770,7 +2776,7 @@ fn sparse_percent() -> u64 {
         std::env::var("VICTORY_DRAIN_PERCENT")
             .ok()
             .and_then(|v| v.trim().parse::<u64>().ok())
-            .map_or(75, |percent| percent.clamp(10, 95))
+            .map_or(40, |percent| percent.clamp(10, 95))
     })
 }
 
