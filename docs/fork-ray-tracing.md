@@ -92,6 +92,7 @@ after it was given them as an unordered access view.
 | variable | does |
 |---|---|
 | `VICTORY_BVH_BUILDER=1` | the builder's stages run |
+| `VICTORY_BVH_PUSH=0` or `1` | what `memory.rs` writes into the directory and the arenas is pushed at once, the dwords that changed, instead of refreshing them whole through the write watch for every list that reads memory by address (7 ms a frame in `GetWriteWatch` with ray tracing, notquiteog 50ff2992); unset: on with the builder, off without |
 | `VICTORY_BVH_FENCES=0` | no fences around the builder's buffer atomics (beloooo's 72e748ea has them too) |
 | `VICTORY_BVH_SIZES_WAIT=1` | submissions that ask for structures' sizes are waited for (off: no help, slow) |
 | `VICTORY_BVH_BUILDER_EARLY=0` | the builder's pipelines are made one after another at its first dispatch, as before (Known gaps) |
