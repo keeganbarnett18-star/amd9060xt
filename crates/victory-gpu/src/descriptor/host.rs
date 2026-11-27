@@ -4296,6 +4296,238 @@ fn constant_twinned(
     true
 }
 
+/// What of a host texture a view's description must fit: its dimension (2:
+/// 1D, 3: 2D, 4: 3D), levels, layers (a 3D texture's depth), and samples.
+#[derive(Clone, Copy, Debug, PartialEq)]
+struct Shape {
+    dimension: i32,
+    levels: u32,
+    layers: u32,
+    samples: u32,
+}
+
+fn shape_of(d: &D3D12_RESOURCE_DESC) -> Shape {
+    Shape {
+        dimension: d.Dimension.0,
+        levels: u32::from(d.MipLevels),
+        layers: u32::from(d.DepthOrArraySize),
+        samples: d.SampleDesc.Count,
+    }
+}
+
+/// Whether levels `first..first + count` (`u32::MAX`: all from `first`) lie
+/// in a texture of `levels`. (A count of none is let through as it was:
+/// what the title means by it is not known.)
+fn levels_in(first: u32, count: u32, levels: u32) -> bool {
+    first < levels && (count == u32::MAX || u64::from(first) + u64::from(count) <= u64::from(levels))
+}
+
+/// The same of layers `first..first + count` in `layers`.
+fn layers_in(first: u32, count: u32, layers: u32) -> bool {
+    first < layers && (count == u32::MAX || u64::from(first) + u64::from(count) <= u64::from(layers))
+}
+
+/// Whether the host takes the shader view `desc` of a texture of `shape`:
+/// its dimension is of the texture's kind, and its levels and layers lie
+/// in the texture. `Err` says what does not.
+///
+/// The host does not check a view's description against its texture
+/// without the debug layer: one that does not fit is an invalid call, for
+/// which it removes the device at some later moment and names nothing.
+/// Buffer views were checked (`buffer_view_ok`) and constant views cut to
+/// their copy; a texture's went to the host as the title wrote it, its
+/// format alone looked at ([`fits`]). Three sessions ended so (test34,
+/// play43, play56: "device removed: the application made a call that is
+/// invalid", first seen by the pass over the heap's buffer views each time,
+/// which asks at its start). Which view it was is not known: this refuses
+/// and names the ones that cannot be right (`view_refused`).
+fn srv_of(shape: &Shape, desc: &D3D12_SHADER_RESOURCE_VIEW_DESC) -> Result<(), &'static str> {
+    const TEXTURE1D: i32 = 2;
+    const TEXTURE2D: i32 = 3;
+    const TEXTURE3D: i32 = 4;
+    // SAFETY: the texture members all begin with the first level and the
+    // count of levels; the others are read where the dimension says so.
+    let (first, count) = unsafe { (desc.Anonymous.Texture2D.MostDetailedMip, desc.Anonymous.Texture2D.MipLevels) };
+    let wants = |dimension: i32, sampled: bool| {
+        if shape.dimension != dimension {
+            Err("its dimension is not the texture's")
+        } else if sampled != (shape.samples > 1) {
+            Err("its samples are not the texture's")
+        } else {
+            Ok(())
+        }
+    };
+    let levels = || if levels_in(first, count, shape.levels) { Ok(()) } else { Err("its levels are not in the texture") };
+    let layers =
+        |first, count| if layers_in(first, count, shape.layers) { Ok(()) } else { Err("its layers are not in the texture") };
+    // SAFETY: as above.
+    unsafe {
+        match desc.ViewDimension {
+            D3D12_SRV_DIMENSION_TEXTURE1D => wants(TEXTURE1D, false).and_then(|()| levels()),
+            D3D12_SRV_DIMENSION_TEXTURE1DARRAY => {
+                let t = desc.Anonymous.Texture1DArray;
+                wants(TEXTURE1D, false).and_then(|()| levels()).and_then(|()| layers(t.FirstArraySlice, t.ArraySize))
+            }
+            D3D12_SRV_DIMENSION_TEXTURE2D => wants(TEXTURE2D, false).and_then(|()| levels()),
+            D3D12_SRV_DIMENSION_TEXTURE2DARRAY => {
+                let t = desc.Anonymous.Texture2DArray;
+                wants(TEXTURE2D, false).and_then(|()| levels()).and_then(|()| layers(t.FirstArraySlice, t.ArraySize))
+            }
+            D3D12_SRV_DIMENSION_TEXTURE2DMS => wants(TEXTURE2D, true),
+            D3D12_SRV_DIMENSION_TEXTURE2DMSARRAY => {
+                let t = desc.Anonymous.Texture2DMSArray;
+                wants(TEXTURE2D, true).and_then(|()| layers(t.FirstArraySlice, t.ArraySize))
+            }
+            D3D12_SRV_DIMENSION_TEXTURE3D => wants(TEXTURE3D, false).and_then(|()| levels()),
+            D3D12_SRV_DIMENSION_TEXTURECUBE => wants(TEXTURE2D, false).and_then(|()| levels()).and_then(|()| layers(0, 6)),
+            D3D12_SRV_DIMENSION_TEXTURECUBEARRAY => {
+                let t = desc.Anonymous.TextureCubeArray;
+                let faces = if t.NumCubes == u32::MAX { u32::MAX } else { t.NumCubes.saturating_mul(6) };
+                wants(TEXTURE2D, false).and_then(|()| levels()).and_then(|()| layers(t.First2DArrayFace, faces))
+            }
+            // A buffer's view, an acceleration structure's or none: not a
+            // texture's.
+            _ => Err("it is not a texture's view"),
+        }
+    }
+}
+
+/// [`srv_of`] for an unordered access view.
+fn uav_of(shape: &Shape, desc: &D3D12_UNORDERED_ACCESS_VIEW_DESC) -> Result<(), &'static str> {
+    const TEXTURE1D: i32 = 2;
+    const TEXTURE2D: i32 = 3;
+    const TEXTURE3D: i32 = 4;
+    let wants = |dimension: i32| if shape.dimension == dimension { Ok(()) } else { Err("its dimension is not the texture's") };
+    let level = |level: u32| if level < shape.levels { Ok(()) } else { Err("its level is not in the texture") };
+    let layers =
+        |first, count| if layers_in(first, count, shape.layers) { Ok(()) } else { Err("its layers are not in the texture") };
+    // SAFETY: the member the dimension says.
+    unsafe {
+        match desc.ViewDimension {
+            D3D12_UAV_DIMENSION_TEXTURE1D => wants(TEXTURE1D).and_then(|()| level(desc.Anonymous.Texture1D.MipSlice)),
+            D3D12_UAV_DIMENSION_TEXTURE1DARRAY => {
+                let t = desc.Anonymous.Texture1DArray;
+                wants(TEXTURE1D).and_then(|()| level(t.MipSlice)).and_then(|()| layers(t.FirstArraySlice, t.ArraySize))
+            }
+            D3D12_UAV_DIMENSION_TEXTURE2D => wants(TEXTURE2D).and_then(|()| level(desc.Anonymous.Texture2D.MipSlice)),
+            D3D12_UAV_DIMENSION_TEXTURE2DARRAY => {
+                let t = desc.Anonymous.Texture2DArray;
+                wants(TEXTURE2D).and_then(|()| level(t.MipSlice)).and_then(|()| layers(t.FirstArraySlice, t.ArraySize))
+            }
+            D3D12_UAV_DIMENSION_TEXTURE3D => {
+                let t = desc.Anonymous.Texture3D;
+                // (The slices of a level: the depth halved for each level.)
+                let depth = (shape.layers >> t.MipSlice.min(31)).max(1);
+                wants(TEXTURE3D).and_then(|()| level(t.MipSlice)).and_then(|()| {
+                    if layers_in(t.FirstWSlice, t.WSize, depth) { Ok(()) } else { Err("its slices are not in the texture") }
+                })
+            }
+            _ => Err("it is not a texture's view"),
+        }
+    }
+}
+
+#[cfg(test)]
+mod view_shapes {
+    use super::*;
+
+    fn srv(words: [u32; 10]) -> D3D12_SHADER_RESOURCE_VIEW_DESC {
+        // SAFETY: 40 bytes in the host's layout.
+        unsafe { std::ptr::from_ref(&words).cast::<D3D12_SHADER_RESOURCE_VIEW_DESC>().read_unaligned() }
+    }
+
+    fn uav(words: [u32; 10]) -> D3D12_UNORDERED_ACCESS_VIEW_DESC {
+        // SAFETY: 40 bytes in the host's layout.
+        unsafe { std::ptr::from_ref(&words).cast::<D3D12_UNORDERED_ACCESS_VIEW_DESC>().read_unaligned() }
+    }
+
+    const ALL: u32 = u32::MAX;
+
+    /// A view of a texture is taken when its dimension, levels and layers
+    /// are the texture's, and refused when they are another's: a buffer's
+    /// description, a level past the last, a cube of a texture of one layer.
+    #[test]
+    fn a_view_must_fit_its_texture() {
+        let flat = Shape { dimension: 3, levels: 10, layers: 1, samples: 1 };
+        let cube = Shape { layers: 6, ..flat };
+        let volume = Shape { dimension: 4, levels: 5, layers: 32, samples: 1 };
+        // (Words: format, dimension, component mapping, a pad, then the
+        // member: first level, levels, ...)
+        let view = |dimension, member: [u32; 4]| srv([67, dimension, 5768, 0, member[0], member[1], member[2], member[3], 0, 0]);
+        // 2D: all levels, the last alone, a range.
+        assert_eq!(srv_of(&flat, &view(4, [0, ALL, 0, 0])), Ok(()));
+        assert_eq!(srv_of(&flat, &view(4, [9, 1, 0, 0])), Ok(()));
+        assert_eq!(srv_of(&flat, &view(4, [2, 8, 0, 0])), Ok(()));
+        assert_eq!(srv_of(&flat, &view(4, [0, 0, 0, 0])), Ok(()), "a count of none is not judged");
+        assert!(srv_of(&flat, &view(4, [10, ALL, 0, 0])).is_err(), "the first level is past the last");
+        assert!(srv_of(&flat, &view(4, [2, 9, 0, 0])).is_err(), "one level too many");
+        // A structured buffer's description on a texture (dimension 1).
+        assert!(srv_of(&flat, &view(1, [0, 0, 16, 0])).is_err());
+        assert!(srv_of(&flat, &view(0, [0, 0, 0, 0])).is_err());
+        // Arrays and cubes.
+        assert_eq!(srv_of(&cube, &view(5, [0, ALL, 0, 6])), Ok(()));
+        assert_eq!(srv_of(&cube, &view(5, [0, ALL, 2, ALL])), Ok(()));
+        assert!(srv_of(&cube, &view(5, [0, ALL, 2, 5])).is_err());
+        assert_eq!(srv_of(&cube, &view(9, [0, ALL, 0, 0])), Ok(()));
+        assert!(srv_of(&flat, &view(9, [0, ALL, 0, 0])).is_err(), "a cube needs six layers");
+        assert_eq!(srv_of(&Shape { layers: 12, ..flat }, &view(10, [0, ALL, 6, 1])), Ok(()));
+        assert!(srv_of(&Shape { layers: 12, ..flat }, &view(10, [0, ALL, 6, 2])).is_err());
+        // Another dimension, other samples.
+        assert_eq!(srv_of(&volume, &view(8, [0, ALL, 0, 0])), Ok(()));
+        assert!(srv_of(&volume, &view(4, [0, ALL, 0, 0])).is_err());
+        assert!(srv_of(&flat, &view(8, [0, ALL, 0, 0])).is_err());
+        assert!(srv_of(&flat, &view(6, [0, 0, 0, 0])).is_err(), "a multisampled view of a plain texture");
+        assert_eq!(srv_of(&Shape { samples: 4, levels: 1, ..flat }, &view(6, [0, 0, 0, 0])), Ok(()));
+        assert!(srv_of(&Shape { samples: 4, levels: 1, ..flat }, &view(4, [0, 1, 0, 0])).is_err());
+
+        // Unordered: format, dimension, then the member (level, ...).
+        let view = |dimension, member: [u32; 4]| uav([42, dimension, member[0], member[1], member[2], member[3], 0, 0, 0, 0]);
+        assert_eq!(uav_of(&flat, &view(4, [0, 0, 0, 0])), Ok(()));
+        assert_eq!(uav_of(&flat, &view(4, [9, 0, 0, 0])), Ok(()));
+        assert!(uav_of(&flat, &view(4, [10, 0, 0, 0])).is_err());
+        assert!(uav_of(&flat, &view(1, [0, 0, 0, 0])).is_err(), "a buffer's");
+        assert_eq!(uav_of(&cube, &view(5, [0, 0, 6, 0])), Ok(()));
+        assert!(uav_of(&cube, &view(5, [0, 4, 3, 0])).is_err());
+        assert_eq!(uav_of(&volume, &view(8, [0, 0, ALL, 0])), Ok(()));
+        assert_eq!(uav_of(&volume, &view(8, [2, 0, 8, 0])), Ok(()), "a level's slices: the depth halved twice");
+        assert!(uav_of(&volume, &view(8, [2, 0, 9, 0])).is_err());
+        assert!(uav_of(&flat, &view(8, [0, 0, ALL, 0])).is_err());
+    }
+}
+
+/// Views of textures refused because their description does not fit the
+/// host texture ([`srv_of`], [`uav_of`]) since the start.
+pub(crate) static VIEWS_REFUSED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// A view the host is not given ([`srv_of`], [`uav_of`]): counted, and the
+/// first 64 said with what they are of.
+fn view_refused(why: &'static str, unordered: bool, resource: usize, texture: &ID3D12Resource, view: &View) {
+    let n = VIEWS_REFUSED.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
+    if n <= 64 || n.is_power_of_two() {
+        // SAFETY: a live resource.
+        let own = unsafe { texture.GetDesc() };
+        tracing::warn!(
+            so_far = n,
+            why,
+            unordered,
+            resource = format_args!("{resource:#x}"),
+            view = ?view,
+            texture = format_args!(
+                "dimension {} {}x{} layers {} levels {} format {} samples {} flags {:#x}",
+                own.Dimension.0,
+                own.Width,
+                own.Height,
+                own.DepthOrArraySize,
+                own.MipLevels,
+                own.Format.0,
+                own.SampleDesc.Count,
+                own.Flags.0
+            ),
+            "a view of a texture whose description does not fit the host texture is not made (the host would take it as an invalid call and remove the device): the slot reads as without the texture"
+        );
+    }
+}
+
 /// Makes the host descriptor for `view` at `at`: the host resource it
 /// views, or `None` if it cannot.
 fn make(view: &View, at: D3D12_CPU_DESCRIPTOR_HANDLE) -> Option<Kept> {
@@ -4405,6 +4637,13 @@ fn make_twinned(
                 {
                     from_base(desc, copy.base);
                 }
+                if let Some(desc) = &desc
+                    // SAFETY: a live resource.
+                    && let Err(why) = srv_of(&shape_of(&unsafe { texture.GetDesc() }), desc)
+                {
+                    view_refused(why, false, resource as usize, texture, view);
+                    return None;
+                }
                 // SAFETY: a live texture and a slot of our heap.
                 unsafe {
                     device.CreateShaderResourceView(
@@ -4464,6 +4703,13 @@ fn make_twinned(
                 None => texture,
             };
             if !fits(texture, desc.as_mut().map(|d| &mut d.Format), true) {
+                return None;
+            }
+            if let Some(desc) = &desc
+                // SAFETY: a live resource.
+                && let Err(why) = uav_of(&shape_of(&unsafe { texture.GetDesc() }), desc)
+            {
+                view_refused(why, true, resource as usize, texture, view);
                 return None;
             }
             // SAFETY: a live texture and a slot of our heap.
