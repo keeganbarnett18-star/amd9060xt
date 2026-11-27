@@ -98,6 +98,9 @@ after it was given them as an unordered access view.
 | `VICTORY_BVH_BUILDER_EARLY=0` | the builder's pipelines are made one after another at its first dispatch, as before (Known gaps) |
 | `VICTORY_BVH_SIZES_BOUND=0` | a structure's compacted size is not given a bound before the card's lands (on with the builder; Known gaps) |
 | `VICTORY_CARD_TITLE_COPIES=1` | a title copy out of memory our shaders write into memory without a host copy (the compacted sizes the title reads on the CPU) is also read back on the card after the shaders, and lands in title memory once the list has run (after fxceless PR #994 fd26fb66; upstream issue #2781) |
+| `VICTORY_BVH_COPY=skip`, `native`, `check` | `CopyForBVHUpdate` (about 57 dispatches a frame; 13.3 ms in light-13): `skip` does not record a copy of a structure onto itself (the title refits in place: it writes back what it reads), `native` also copies the others by a pass of ours, `check` compares ours with the program's (xeltax/vicky 7f78f843, eb6a31a0); unset: translated, as before |
+| `VICTORY_PORT_RT=1` | a constant buffer read behind a copy at its place no longer holds a submission until every flight has landed (61 ms a frame in the city, 15-23 on the boat at the source; avatarmanz 84917c34) |
+| `VICTORY_BVH_FAULTS_ALL=<n>` | pages taken from faults in all (2048; met in the first minute with rays at the source; avatarmanz b0ba5faa) |
 | `VICTORY_BVH_BOUNDS=0` | the builder's accesses are not bounded |
 | `VICTORY_BVH_TRACE=1` | logs what sizes are asked, when they came, and the copies (diagnostics) |
 | `VICTORY_BVH_QUARANTINE=1` | nothing it stores comes back to title memory |
