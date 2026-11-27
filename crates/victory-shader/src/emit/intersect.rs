@@ -123,6 +123,23 @@ impl<'a> Lower<'a> {
             x.push(self.i32_of(v)?);
         }
         let pointer = x[0];
+        // `VICTORY_BVH_MISS=1` ([`crate::emit::bvh_miss`]): no node is read; by
+        // the pointer's kind a triangle node gives the triangle miss and any
+        // other node four `NONE` (a box with no child), so every walk ends at
+        // its first node.
+        if crate::emit::bvh_miss() {
+            let c = self.cur;
+            let (k4, k7) = (self.s.m.i32(4), self.s.m.i32(7));
+            let kind = self.s.m.bin(c, Bin::And, pointer, k7);
+            let is_triangle = self.s.m.cmp(c, pred::IULT, kind, k4);
+            let none = self.s.m.i32(bvh::NONE);
+            for (k, miss) in bvh::MISS.into_iter().enumerate() {
+                let m = self.s.m.i32(miss.to_bits());
+                let r = self.s.m.select(c, is_triangle, m, none);
+                self.write(inst, Reg::V(dst + k as u8), r, guard);
+            }
+            return Ok(());
+        }
         let pointer_high = wide.then(|| x[1]);
         let f: Vec<V> = x[1 + usize::from(wide)..]
             .iter()

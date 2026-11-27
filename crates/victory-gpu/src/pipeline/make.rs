@@ -57,6 +57,12 @@ fn named(shaders: &[Arc<Shader>], name: &[u8]) -> bool {
 }
 
 fn left_out(shaders: &[Arc<Shader>]) -> Option<&'static str> {
+    // With every node test a miss (`VICTORY_BVH_MISS=1`) the ray programs
+    // walk nothing and write the same every frame: none is left out (in
+    // session play53 78 of them, 398 dispatches a frame, were).
+    if victory_shader::emit::bvh_miss() {
+        return None;
+    }
     static SKIP_RT_RESOLVE: OnceLock<bool> = OnceLock::new();
     let skip_rt = *SKIP_RT_RESOLVE.get_or_init(|| {
         let builder = victory_shader::bvh_builder_on();

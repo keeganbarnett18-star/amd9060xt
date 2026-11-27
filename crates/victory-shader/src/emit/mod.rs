@@ -200,6 +200,23 @@ pub fn builder_fences() -> bool {
     *ON.get_or_init(|| std::env::var_os("VICTORY_BVH_FENCES").is_none_or(|v| v != "0"))
 }
 
+/// Whether every ray-tracing node test misses without reading its node
+/// (`VICTORY_BVH_MISS=1`; off unless set): a box node gives no child, a
+/// triangle node the triangle miss, so the title's walks end at their first
+/// node. For runs without the structure builder (`VICTORY_BVH_BUILDER` unset):
+/// its structures are never built, and the walks read whatever that memory
+/// holds (the reflection rays of `CS_RaytraceVBuffer_RayBinning` made whole
+/// tiles of water dark in halfwave50's runs). With every test a miss, the
+/// title's ray programs can run instead of being left out
+/// (`victory-gpu`'s `pipeline::make`), and what they write is the same
+/// every frame. The idea and the switch's name are trustno1-coder's
+/// (VIctory-NVIDIA 24a479d3; halfwave50's cc55f7c0, GPL-3.0-or-later); the
+/// code is ours. Part of the translation: the shader cache keys on it.
+pub fn bvh_miss() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var("VICTORY_BVH_MISS").is_ok_and(|v| v.trim() == "1"))
+}
+
 /// Whether the structure builder's accesses through its root views stay near
 /// them, and a size in a structure's header that cannot be one counts as none
 /// (`VICTORY_BVH_BOUNDS=0`: neither). Part of the translation: the shader
