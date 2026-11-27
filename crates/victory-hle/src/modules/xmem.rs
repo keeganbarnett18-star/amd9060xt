@@ -52,7 +52,7 @@ pub(crate) fn on_wine() -> bool {
 /// under Wine, and with the page pool in place on the GPU side
 /// (`VICTORY_POOL_IN_PLACE=1`).
 fn whole_sections() -> bool {
-    on_wine() || victory_gpu::pool_in_place()
+    on_wine() || victory_gpu::pool_layout()
 }
 
 /// The most 64 KiB pages in one section of the page pool while it is in
@@ -683,7 +683,7 @@ pub extern "system" fn XMemAllocatePhysicalPages(
     // host refused to open the title's 6.1 GiB one as a heap ("the
     // parameter is incorrect") and opened its 710 MiB one. A page is a slice
     // of its own section either way, and views map slices.
-    let chunk = if victory_gpu::pool_in_place() { pool_chunk_pages().min(n) } else { n };
+    let chunk = if victory_gpu::pool_layout() { pool_chunk_pages().min(n) } else { n };
     let mut sections: Vec<Arc<Section>> = Vec::with_capacity(n.div_ceil(chunk));
     for first_page in (0..n).step_by(chunk) {
         let pages_here = chunk.min(n - first_page);

@@ -264,6 +264,30 @@ fn switch(value: Option<&str>) -> bool {
     value.is_some_and(|v| v.trim() == "1")
 }
 
+/// Whether the runtime lays the page pool out as it does for
+/// [`pool_in_place`] (`xmem`: sections committed whole, each of at most
+/// `VICTORY_POOL_CHUNK_MB`, 1 GiB): with `VICTORY_POOL_IN_PLACE=1`, and with
+/// `VICTORY_POOL_IN_PLACE=layout`, which places nothing (no heap is opened
+/// on a section, so none of the pool is held for the card).
+///
+/// Why: driving in play64 (`1`, on a fresh boot) ran at 17.9 fps median
+/// against 8.4 in play65b (unset): preparing 40 ms against 90, the write
+/// watch 2.9 ms against 17.4. Yet only 232 MB was placed, while the six
+/// sections opened as heaps held 6.2 GB of the card's budget in the PC's
+/// memory, and play64 ended in 1,937 failed buffer allocations and a reset.
+/// `layout` asks whether the layout alone gives the speed (one 6.1 GiB
+/// section's views are walked by Windows under its lock as the title
+/// remaps; nyalone's VICTORY_SECTION_MB, e1d66caa, saw the same).
+pub fn pool_layout() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| pool_in_place() || layout_switch(std::env::var("VICTORY_POOL_IN_PLACE").ok().as_deref()))
+}
+
+/// The switch's value as [`pool_layout`] reads it beside `1`: `layout`.
+fn layout_switch(value: Option<&str>) -> bool {
+    value.is_some_and(|v| v.trim().eq_ignore_ascii_case("layout"))
+}
+
 /// A page pool section opened as a heap, by its handle; no heap if the host
 /// refused (asked once a section).
 struct PoolHeap {
@@ -1835,8 +1859,12 @@ pub(crate) mod tests {
     fn the_page_pool_switch_takes_1_only() {
         assert!(switch(Some("1")));
         assert!(switch(Some(" 1 ")));
-        for off in [None, Some(""), Some("0"), Some("2"), Some("true"), Some("yes")] {
+        for off in [None, Some(""), Some("0"), Some("2"), Some("true"), Some("yes"), Some("layout")] {
             assert!(!switch(off), "{off:?}");
+        }
+        assert!(layout_switch(Some("layout")) && layout_switch(Some(" Layout ")));
+        for off in [None, Some(""), Some("0"), Some("1"), Some("lay")] {
+            assert!(!layout_switch(off), "{off:?}");
         }
     }
 

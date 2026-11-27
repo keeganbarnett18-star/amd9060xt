@@ -125,7 +125,7 @@ pub fn frames_begun() -> u64 {
     frame::current()
 }
 #[cfg(windows)]
-pub use inplace::{pool_in_place, title_memory_freeing, title_memory_section, title_memory_section_gone, title_memory_view};
+pub use inplace::{pool_in_place, pool_layout, title_memory_freeing, title_memory_section, title_memory_section_gone, title_memory_view};
 #[cfg(windows)]
 pub use watch::{
     kernel_writing, title_memory_allocated, title_memory_freed, title_memory_reading, title_memory_remapped,
