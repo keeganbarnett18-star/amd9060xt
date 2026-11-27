@@ -1742,19 +1742,24 @@ pub(crate) fn room(memory: Option<[u64; 4]>) -> bool {
 /// their room kept, the queue stops that much earlier while the world
 /// loads and gets it back as the targets are made.
 ///
-/// Once the world's targets stand (their bytes past
-/// [`targets_settle`]'s floor and not grown for its seconds), what is kept
-/// is what they reached plus a margin, no longer the whole 3,072: in session
-/// play50 they stood at 1,888 MB from the tenth minute, so 1,165 MB stayed
-/// kept for targets never made, more than the 150 MB by which [`room`]
-/// turned the queue down from minute 2 to the end (newer textures went
-/// without their finer levels: the picture grew blurrier the longer one
-/// played). A target made after that starts the wait again, with the whole
-/// reserve kept meanwhile.
+/// Once the world is in (its targets have reached
+/// [`targets_headroom`]'s world line, 1,024 MB), what is kept is a headroom
+/// above what the targets hold now (512 MB), no longer all of the 3,072:
+/// the reserve is for the world's first frame, whose targets come at once;
+/// after that they grow a few tens of MB a minute (sessions play50 and
+/// play51 on a 9060 XT at 1080p: 1,147 MB a minute in, 1,888 at 26). With
+/// the whole reserve, [`room`] turned the queue down in 142 of play50's 302
+/// five-second samples and 102 of play51's 115 (newer textures went without
+/// their finer levels: the picture grew blurrier the longer one played);
+/// with the headroom, in one of each (`sim-room.ps1` replays the rule over a
+/// session's log). A wait for the targets to stand (the first form of this)
+/// never ended there: they kept growing.
 #[cfg(windows)]
 pub(crate) fn targets_room_kept() -> u64 {
-    use std::sync::atomic::Ordering::Relaxed;
+    use std::sync::atomic::{AtomicU64, Ordering::Relaxed};
     static MOST: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
+    // The most the targets have held.
+    static PEAK: AtomicU64 = AtomicU64::new(0);
     let most = *MOST.get_or_init(|| {
         std::env::var("VICTORY_CARD_ROOM_FOR_TARGETS_MB")
             .ok()
@@ -1763,59 +1768,34 @@ pub(crate) fn targets_room_kept() -> u64 {
     });
     // Every host texture's bytes less those of the copies the title fills.
     let targets = HOST_TEXTURES[1].load(Relaxed).saturating_sub(KINDS[1].load(Relaxed));
-    most.min(settled_targets_line(targets, crate::host::now_ms()))
-        .saturating_sub(targets)
+    let peak = PEAK.fetch_max(targets, Relaxed).max(targets);
+    let (world, headroom) = targets_headroom();
+    targets_kept(most, targets, peak, world, headroom)
 }
 
-/// When the world's targets count as standing (`VICTORY_TARGETS_SETTLE_S`,
-/// 60; 0: never, the whole reserve is kept as before), the bytes below
-/// which they do not (`VICTORY_TARGETS_SETTLE_MIN_MB`, 1,536: the loading
-/// screens' 652 MB stand for minutes before the world's 2,255 come at
-/// once), and the margin kept above what they reached
-/// (`VICTORY_TARGETS_MARGIN_MB`, 384).
+/// The targets' bytes from which the world counts as in
+/// (`VICTORY_TARGETS_WORLD_MB`, 1,024: the loading screens hold some
+/// hundreds, the world's first frame at 1080p 1,100 and more) and the
+/// headroom kept above them then (`VICTORY_TARGETS_HEADROOM_MB`, 512; 0: the
+/// whole reserve throughout, as before).
 #[cfg(windows)]
-fn targets_settle() -> (u64, u64, u64) {
-    static SETTLE: std::sync::OnceLock<(u64, u64, u64)> = std::sync::OnceLock::new();
-    *SETTLE.get_or_init(|| {
+fn targets_headroom() -> (u64, u64) {
+    static SET: std::sync::OnceLock<(u64, u64)> = std::sync::OnceLock::new();
+    *SET.get_or_init(|| {
         let read = |name: &str, default: u64| {
             std::env::var(name).ok().and_then(|v| v.trim().parse::<u64>().ok()).unwrap_or(default)
         };
-        (
-            read("VICTORY_TARGETS_SETTLE_S", 60) * 1000,
-            read("VICTORY_TARGETS_SETTLE_MIN_MB", 1536) << 20,
-            read("VICTORY_TARGETS_MARGIN_MB", 384) << 20,
-        )
+        (read("VICTORY_TARGETS_WORLD_MB", 1024) << 20, read("VICTORY_TARGETS_HEADROOM_MB", 512) << 20)
     })
 }
 
-/// The line [`targets_room_kept`] keeps room up to, by the targets' bytes
-/// now and the time in milliseconds: their highest bytes so far plus the
-/// margin once that highest has stood long enough, else no line.
-#[cfg(windows)]
-fn settled_targets_line(targets: u64, now_ms: u64) -> u64 {
-    use std::sync::atomic::{AtomicU64, Ordering::Relaxed};
-    // The highest bytes seen, and the time (from 1) they last grew.
-    static PEAK: AtomicU64 = AtomicU64::new(0);
-    static GREW: AtomicU64 = AtomicU64::new(0);
-    let (settle_ms, floor, margin) = targets_settle();
-    let now = now_ms.max(1);
-    let before = PEAK.fetch_max(targets, Relaxed);
-    if targets > before || GREW.load(Relaxed) == 0 {
-        GREW.store(now, Relaxed);
-    }
-    let peak = before.max(targets);
-    targets_line(peak, now.saturating_sub(GREW.load(Relaxed)), settle_ms, floor, margin)
-}
-
-/// [`settled_targets_line`]'s rule alone: `peak` plus `margin` once `peak`
-/// is at least `floor` and has stood `stood_ms` of `settle_ms` (not 0).
+/// [`targets_room_kept`]'s rule alone: of the reserve `most`, what is not
+/// held by the targets' `targets` bytes; once their `peak` has reached
+/// `world`, no more than `headroom` (not 0).
 #[cfg(any(windows, test))]
-fn targets_line(peak: u64, stood_ms: u64, settle_ms: u64, floor: u64, margin: u64) -> u64 {
-    if settle_ms != 0 && peak >= floor && stood_ms >= settle_ms {
-        peak + margin
-    } else {
-        u64::MAX
-    }
+fn targets_kept(most: u64, targets: u64, peak: u64, world: u64, headroom: u64) -> u64 {
+    let line = if headroom != 0 && peak >= world { most.min(targets + headroom) } else { most };
+    line.saturating_sub(targets)
 }
 
 /// [`room`] as it was at most a tenth of a second ago, for a question
@@ -4756,20 +4736,24 @@ float4 lit() : SV_Target { return 1.0; }
         assert_eq!(texture_floor_bytes(Some(32 * GIB)), 2 * GIB);
     }
 
-    /// The targets' reserve shrinks to what they reached plus the margin
-    /// only once that is past the floor and has stood long enough.
+    /// The whole reserve until the world is in, then a headroom above what
+    /// the targets hold.
     #[test]
-    fn targets_room_follows_targets_that_stand() {
+    fn targets_room_keeps_a_headroom_once_the_world_is_in() {
         const MB: u64 = 1 << 20;
-        let (settle, floor, margin) = (60_000, 1536 * MB, 384 * MB);
-        // The loading screens' 652 MB: never a line, however long they stand.
-        assert_eq!(targets_line(652 * MB, 600_000, settle, floor, margin), u64::MAX);
-        // The world's targets, grown 10 s ago: not yet.
-        assert_eq!(targets_line(1888 * MB, 10_000, settle, floor, margin), u64::MAX);
-        // Standing a minute: what they reached plus the margin.
-        assert_eq!(targets_line(1888 * MB, 60_000, settle, floor, margin), 2272 * MB);
-        // Switched off.
-        assert_eq!(targets_line(1888 * MB, 600_000, 0, floor, margin), u64::MAX);
+        let (most, world, headroom) = (3072 * MB, 1024 * MB, 512 * MB);
+        // Loading screens: all of the reserve that the targets do not hold.
+        assert_eq!(targets_kept(most, 652 * MB, 652 * MB, world, headroom), 2420 * MB);
+        // The world's first frame (play51: 1,147 MB a minute in): the headroom.
+        assert_eq!(targets_kept(most, 1147 * MB, 1147 * MB, world, headroom), 512 * MB);
+        // Grown on (play50 at 26 minutes): still the headroom.
+        assert_eq!(targets_kept(most, 1888 * MB, 1888 * MB, world, headroom), 512 * MB);
+        // Targets let go after the world was in: the headroom above what is left.
+        assert_eq!(targets_kept(most, 900 * MB, 1888 * MB, world, headroom), 512 * MB);
+        // Near the reserve: no more than it.
+        assert_eq!(targets_kept(most, 2900 * MB, 2900 * MB, world, headroom), 172 * MB);
+        // Headroom 0: the whole reserve throughout, as before.
+        assert_eq!(targets_kept(most, 1888 * MB, 1888 * MB, world, 0), 1184 * MB);
     }
 
     /// A placed texture viewed from a later level has a host copy of that
