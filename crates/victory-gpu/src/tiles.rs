@@ -351,18 +351,29 @@ impl Tiled {
     /// card's gate in `draw.rs` on the ground that it takes no memory;
     /// with tiles given here regardless, the line would not bound these
     /// textures.)
+    /// `small`: the held levels that get tiles all the same without room
+    /// (`resource.rs` `small_levels`: those of 256 texels a side or less,
+    /// while the card is short of room but under its higher line): the
+    /// texture is shown from them, at a lower resolution, until the others
+    /// get theirs, instead of not at all. A texture made level by level is
+    /// never made smaller (`resource.rs` `ShortOfRoom`); its larger levels
+    /// wait, and get their tiles when the card has room again
+    /// (`crate::descriptor::host::levels_waiting`). After ka1qux 08fd102
+    /// (GPL-3.0-or-later).
     /// Returns whether the first level a view may show changed, and
     /// whether a level named is still without tiles (no room, or no heap
     /// could be had): the caller has the upload recorded again later, or
     /// the level would stay empty until the title writes the texture.
-    pub(crate) fn uploaded(&self, texture: &ID3D12Resource, held: u32, room: bool) -> (bool, bool) {
+    pub(crate) fn uploaded(&self, texture: &ID3D12Resource, held: u32, room: bool, small: u32) -> (bool, bool) {
         match host() {
-            Some(host) => self.uploaded_on(host.queue(), &host.device, texture, held, room),
+            Some(host) => self.uploaded_within(host.queue(), &host.device, texture, held, room, small),
             None => (false, false),
         }
     }
 
-    /// [`Tiled::uploaded`] on a queue and a device.
+    /// [`Tiled::uploaded`] on a queue and a device, with no level given
+    /// without room.
+    #[cfg(test)]
     pub(crate) fn uploaded_on(
         &self,
         queue: &ID3D12CommandQueue,
@@ -371,14 +382,29 @@ impl Tiled {
         held: u32,
         room: bool,
     ) -> (bool, bool) {
+        self.uploaded_within(queue, device, texture, held, room, 0)
+    }
+
+    /// [`Tiled::uploaded`] on a queue and a device.
+    pub(crate) fn uploaded_within(
+        &self,
+        queue: &ID3D12CommandQueue,
+        device: &ID3D12Device,
+        texture: &ID3D12Resource,
+        held: u32,
+        room: bool,
+        small: u32,
+    ) -> (bool, bool) {
         let held = held & self.every_level();
         let mut given = self.given.lock().unwrap_or_else(|e| e.into_inner());
         self.held.store(held, Ordering::Relaxed);
         let card = self.card.load(Ordering::Relaxed);
         let named = held | card;
         // The levels the card itself writes are few and are not kept
-        // waiting: a write of the card's into no memory is lost.
-        let changed = self.give_locked(&mut given, queue, device, texture, named, if room { named } else { card });
+        // waiting: a write of the card's into no memory is lost. Without
+        // room, held levels get tiles only if they are small.
+        let allowed = if room { named } else { card | (held & small) };
+        let changed = self.give_locked(&mut given, queue, device, texture, named, allowed);
         let missing = self.without_locked(&given, named) != 0;
         (changed, missing)
     }

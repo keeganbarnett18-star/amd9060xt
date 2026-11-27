@@ -958,7 +958,21 @@ fn unlike(dst: This, src: This) -> bool {
             tracing::warn!(?dst, ?src, "copy between a stand-in target and title-format texels skipped")
         });
     }
-    unlike
+    // shortcut: a copy from or into a host copy without the title's largest
+    // levels (`crate::resource::levels_left_out`: one made short of room, or
+    // of the levels its views show) is not made; the title's subresources
+    // are not that copy's, and a copy past them removes the device. Only
+    // placed textures' copies leave levels out, and the title names those
+    // in no copy of its own: this holds should that change. (After ka1qux
+    // 08fd102.)
+    let short = crate::resource::levels_left_out(dst) > 0 || crate::resource::levels_left_out(src) > 0;
+    if short {
+        static ONCE: std::sync::Once = std::sync::Once::new();
+        ONCE.call_once(|| {
+            tracing::warn!(?dst, ?src, "copy with a texture whose host copy leaves out its largest levels skipped")
+        });
+    }
+    unlike || short
 }
 
 /// Copies left out because both sides were one host texture
@@ -1276,6 +1290,9 @@ fn read_back(
     }
     if dst.kind != FOOTPRINT || src.kind == FOOTPRINT {
         return Err("not a texture subresource into a placed footprint");
+    }
+    if crate::resource::levels_left_out(src.resource) > 0 {
+        return Err("a texture whose host copy leaves out its largest levels");
     }
     if (x, y, z) != (0, 0, 0) {
         return Err("a destination corner other than the footprint's");

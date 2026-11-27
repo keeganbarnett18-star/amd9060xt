@@ -2048,6 +2048,44 @@ fn staging(resource: This, copy: &crate::resource::HostTexture, first: u32) -> O
     Some(s)
 }
 
+#[cfg(all(test, windows))]
+mod short_tests {
+    /// A host copy made short of room (`crate::resource::ShortOfRoom`) is
+    /// staged from the title's first level it has, whatever level the view
+    /// starts at, into the copy's own subresources from 0.
+    #[test]
+    fn a_texture_made_short_of_room_is_staged_from_the_levels_it_has() {
+        use windows_sys::Win32::System::Memory::{MEM_COMMIT, MEM_RESERVE, PAGE_READWRITE, VirtualAlloc};
+        if crate::host::host().is_none() || crate::tiles::wanted() {
+            return;
+        }
+        // 1024x1024 BC7, eleven levels, 4 KiB blocks.
+        let desc = [3u32, 0, 0, 0, 1024, 0, 1024, 0xb_0001, 98, 1, 0, 0x105, 0, 0];
+        let whole = crate::resource::placed_bytes(&desc).unwrap() as usize;
+        // SAFETY: memory of our own that stays (the title texture made for
+        // it is kept by its address).
+        let base = unsafe { VirtualAlloc(std::ptr::null(), whole, MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE) };
+        assert!(!base.is_null());
+        let resource = crate::resource::texture_at(base as u64, &desc).unwrap();
+        let copy = {
+            let _short = crate::resource::ShortOfRoom::begin();
+            crate::resource::host_copy(resource).unwrap()
+        };
+        // (Another side than 256, or levels always left out: another copy.)
+        if copy.short == 2 && copy.base == 2 {
+            let staging = super::staging(resource, &copy, 0).expect("staging");
+            assert_eq!((staging.first, staging.level0, staging.mips), (2, 2, 11));
+            assert_eq!(staging.footprints.len(), 9);
+            assert_eq!(staging.footprints[0].Footprint.Width, 256);
+            assert_eq!(staging.read as u64, staging.layout.bytes_from(2));
+            // A view from the title's first level asks for what it has.
+            assert!(std::sync::Arc::ptr_eq(&staging, &super::staging(resource, &copy, 0).unwrap()));
+            drop(staging);
+            super::unstage(resource);
+        }
+    }
+}
+
 #[cfg(test)]
 mod title_memory_tests {
     use super::with_title;

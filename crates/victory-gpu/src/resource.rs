@@ -1190,6 +1190,11 @@ pub(crate) struct HostTexture {
     /// The title's level its level 0 is ([`held_only`]): larger levels have
     /// no place in it.
     pub(crate) base: u32,
+    /// Of `base`, the levels left out because the card had no room for
+    /// them ([`ShortOfRoom`]): more than the views asked to leave out. 0 for
+    /// a copy made as whole as its views want; one with more is replaced by
+    /// such a copy once the card has room again ([`regrow`]).
+    pub(crate) short: u32,
     /// Tells host copies apart that one texture had one after the other.
     pub(crate) serial: u64,
     /// Made in place of one with fewer levels: the slots that show that one
@@ -1246,6 +1251,11 @@ struct Hosted {
     wanted: std::sync::atomic::AtomicU32,
     /// The next host copy takes the place of one with fewer levels.
     grown: std::sync::atomic::AtomicBool,
+    /// The next host copy takes the place of one made short of room
+    /// ([`ShortOfRoom`]) for another reason than room (moved out of a
+    /// draining block, or a view from a larger level): made short too, as
+    /// the one it replaces, until the card has room ([`regrow`]).
+    short_next: std::sync::atomic::AtomicBool,
 }
 
 /// Whether a texture the title places in memory is read, kept and uploaded
@@ -1373,8 +1383,18 @@ pub(crate) fn want_level(this: This, first: u32) {
         r.host.wanted.fetch_min(first, Relaxed);
         return;
     };
-    if host.base == 0 || host.base <= base_level(&r.desc, first) {
+    // (Levels a copy leaves out for want of room are not asked for here:
+    // [`regrow`] gives them back once there is room. Nor those every copy
+    // leaves out, [`floor_level`]: the copy made for them would leave them
+    // out again.)
+    let kept = host.base - host.short;
+    if kept == 0 || kept <= base_level(&r.desc, first).max(floor_level(&r.desc)) {
         return;
+    }
+    // One made short of room is replaced by one as short while there is
+    // still none.
+    if host.short > 0 {
+        r.host.short_next.store(!room_lately(), Relaxed);
     }
     r.host.wanted.store(first, Relaxed);
     // Under the lock, as in `let_go_idle`.
@@ -1597,13 +1617,27 @@ fn hosted(this: This, make: bool) -> Option<Made> {
         // The levels views show ([`held_only`]), those of the slots shaders
         // pick by index among them.
         let mut base = 0;
-        if shape_fits && r.host.placed.load(Relaxed) && held_only() && alias_of(this).is_none() {
+        let placed = shape_fits && r.host.placed.load(Relaxed) && tiled.is_none() && alias_of(this).is_none();
+        if placed && held_only() {
             let wanted = r.host.wanted.load(Relaxed);
             let viewed = crate::descriptor::host::first_viewed(r.data() as u64).unwrap_or(u32::MAX);
             let first = wanted.min(viewed);
             if first != u32::MAX {
                 base = base_level(&r.desc, first);
             }
+        }
+        // And without the largest levels when the card is short of room
+        // ([`ShortOfRoom`]), or always (`VICTORY_TEXTURE_DROP_MIPS`): never
+        // one made level by level (its levels take the card's memory as
+        // they come), nor one read through a view placed over a texture
+        // the host writes (copied level by level from it: `alias_of`).
+        let mut short = 0;
+        if placed {
+            let kept = base.max(floor_level(&r.desc));
+            let short_now = r.host.short_next.swap(false, Relaxed) | SHORT.get();
+            let least = if short_now { base_level(&r.desc, short_wanted(&r.desc)) } else { 0 };
+            short = least.saturating_sub(kept);
+            base = kept.max(least);
         }
         let texture = match texture {
             Some(texture) => Some(texture),
@@ -1631,8 +1665,15 @@ fn hosted(this: This, make: bool) -> Option<Made> {
             None => HostTexture::new(texture, state),
         };
         host.base = base;
+        host.short = short;
         host.grown.store(r.host.grown.swap(false, Relaxed), Relaxed);
-        if base > 0 {
+        if short > 0 {
+            SHORT_MADE[0].fetch_add(1, Relaxed);
+            SHORT_MADE[1].fetch_add(host.bytes, Relaxed);
+            // Its slots are looked at again once the card has room.
+            crate::descriptor::host::made_short(r.data() as u64);
+        }
+        if base > short {
             HELD[0].fetch_add(1, Relaxed);
             HELD[1].fetch_add(host.bytes, Relaxed);
             HELD[3].fetch_add(footprint(&r.desc).map_or(0, |f| f.size), Relaxed);
@@ -1860,6 +1901,235 @@ fn room_percent() -> u64 {
             .and_then(|v| v.trim().parse::<u64>().ok())
             .map_or(90, |percent| percent.clamp(50, 97))
     })
+}
+
+/// Since the start, for the memory line: host copies made short of room
+/// ([`ShortOfRoom`]) and their bytes; uploads of textures made level by
+/// level (`crate::tiles`) in which only their small levels could be given
+/// the card's memory ([`small_levels`]); short copies replaced by whole ones
+/// once the card had room again ([`regrow`]); and the slots made due for
+/// that (`crate::descriptor::host::HostHeap::texture_slots_regrow`).
+#[cfg(windows)]
+pub(crate) static SHORT_MADE: [std::sync::atomic::AtomicU64; 5] = [const { std::sync::atomic::AtomicU64::new(0) }; 5];
+
+#[cfg(windows)]
+thread_local! {
+    /// The host copies made on this thread now are made while the card has
+    /// no room for whole ones ([`ShortOfRoom`]).
+    static SHORT: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// While it lives, host copies of placed textures the title fills are made
+/// on this thread without their levels past [`short_side`] texels a side:
+/// the card has no room for whole ones ([`room`]), and such textures were
+/// not made at all. A material that samples one read black for as long as
+/// the card stayed full (an open-world save: 14,000 to 18,000 slots never
+/// uploaded, walls, wardrobes and cupboards black beside textured ones): a
+/// lower resolution is better than none. A copy made so leaves those levels
+/// out as one viewed from a later level does ([`HostTexture::base`], whose
+/// views, staging and uploads count from it already), and is replaced by a
+/// whole one once the card has room again ([`regrow`]).
+/// Only 2D textures of one layer that the title places in memory: a
+/// replaced copy's slots are found by where that memory starts, and the
+/// title names such textures in no copy of its own. A texture made level
+/// by level (`crate::tiles`) is never made smaller ([`small_levels`]
+/// instead), nor one a view placed over a texture the host writes reads
+/// ([`alias_of`]: copied level by level from it).
+/// After ka1qux/BRVIctory-ka1qux 08fd102, itself after
+/// Belobug/VIctory-Belobug-AMD ebd990d and fxceless/victory-fork PR #610
+/// (GPL-3.0-or-later).
+#[cfg(windows)]
+pub(crate) struct ShortOfRoom(());
+
+#[cfg(windows)]
+impl ShortOfRoom {
+    /// Host copies made on this thread are made short of room until the
+    /// value is dropped.
+    pub(crate) fn begin() -> ShortOfRoom {
+        SHORT.set(true);
+        ShortOfRoom(())
+    }
+}
+
+#[cfg(windows)]
+impl Drop for ShortOfRoom {
+    fn drop(&mut self) {
+        SHORT.set(false);
+    }
+}
+
+/// Whether host copies are made short of room ([`ShortOfRoom`]) when the
+/// card has none for whole ones: while the card's memory in use, counted as
+/// [`room`] counts it (less the room in our blocks, with what is kept for
+/// card copies of title buffers and for render targets), is under 97
+/// percent of its budget (`VICTORY_TEXTURE_SHORT_PERCENT` says another
+/// share, from [`room_percent`] to 98), and while its use as the system
+/// counts it is under [`room`]'s hard ceiling ([`hard_percent`], 95).
+/// The ceiling holds for these too: it is where the system begins to move
+/// the card's memory into the PC's (play52 stood at 98.6 %, play50 reached
+/// 108.8 %), and a copy without its largest levels still takes some of the
+/// card (a block-compressed 256 by 256 with its levels, some 87 KB).
+/// `VICTORY_TEXTURE_SHORT=0` makes none, as before; so does
+/// `VICTORY_TEXTURE_BUDGET_MB`, a limit of its own.
+#[cfg(windows)]
+pub(crate) fn room_for_short(memory: Option<[u64; 4]>) -> bool {
+    static PERCENT: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
+    let percent = *PERCENT.get_or_init(|| {
+        if std::env::var_os("VICTORY_TEXTURE_SHORT").is_some_and(|v| v == "0")
+            || std::env::var_os("VICTORY_TEXTURE_BUDGET_MB").is_some()
+        {
+            return 0;
+        }
+        std::env::var("VICTORY_TEXTURE_SHORT_PERCENT")
+            .ok()
+            .and_then(|v| v.trim().parse::<u64>().ok())
+            .map_or(97u64.max(room_percent()), |p| p.clamp(room_percent(), 98))
+    });
+    let Some([budget, used, ..]) = memory.filter(|_| percent != 0) else {
+        return false;
+    };
+    let counted =
+        used.saturating_sub(crate::pool::texture_room()) + crate::shadow::card_room_kept() + targets_room_kept();
+    under_short_line(budget, used, counted, percent, hard_percent())
+}
+
+/// [`room_for_short`]'s rule: the card's `used` bytes (as the system counts
+/// them) under `hard` percent of `budget`, and its `counted` ones (as
+/// [`room`] counts them) under `percent` of it.
+#[cfg(any(windows, test))]
+fn under_short_line(budget: u64, used: u64, counted: u64, percent: u64, hard: u64) -> bool {
+    budget != 0 && used < budget / 100 * hard && counted < budget / 100 * percent
+}
+
+/// The longest side, in texels, of a host copy made short of room
+/// ([`ShortOfRoom`]): 256 unless `VICTORY_TEXTURE_SHORT_SIDE` says another
+/// (16 to 4096).
+#[cfg(windows)]
+fn short_side() -> u64 {
+    static SIDE: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
+    *SIDE.get_or_init(|| {
+        std::env::var("VICTORY_TEXTURE_SHORT_SIDE")
+            .ok()
+            .and_then(|v| v.trim().parse::<u64>().ok())
+            .map_or(256, |side| side.clamp(16, 4096))
+    })
+}
+
+/// The largest levels every host copy of a placed texture of 512 texels a
+/// side or more leaves out, room or not: `VICTORY_TEXTURE_DROP_MIPS` (0 to
+/// 4; 0 without it), for cards smaller than the title's textures
+/// (fxceless/victory-fork PR #610).
+#[cfg(windows)]
+fn drop_always() -> u32 {
+    static N: std::sync::OnceLock<u32> = std::sync::OnceLock::new();
+    *N.get_or_init(|| {
+        std::env::var("VICTORY_TEXTURE_DROP_MIPS").ok().and_then(|v| v.trim().parse::<u32>().ok()).unwrap_or(0).min(4)
+    })
+}
+
+/// How many of the largest levels of a texture `width` by `height` are past
+/// `side` texels a side.
+#[cfg(any(windows, test))]
+fn levels_past(width: u64, height: u64, side: u64) -> u32 {
+    let mut n = 0;
+    while n < 63 && width.max(height) >> n > side {
+        n += 1;
+    }
+    n
+}
+
+/// How many of the largest levels of a texture `width` by `height` a host
+/// copy is asked to leave out: `always` of one of 512 texels a side or more,
+/// and when it is made short of room (`short`) at least those past `side`.
+/// (What it can leave out is [`base_level`]'s to say: whole blocks, one
+/// level left.)
+#[cfg(any(windows, test))]
+fn levels_out(width: u64, height: u64, side: u64, always: u32, short: bool) -> u32 {
+    let always = if always > 0 && width.min(height) >= 512 { always } else { 0 };
+    if short { levels_past(width, height, side).max(always) } else { always }
+}
+
+/// The levels a host copy of the texture `desc` made short of room is asked
+/// to leave out ([`levels_out`]).
+#[cfg(windows)]
+fn short_wanted(desc: &ResourceDesc) -> u32 {
+    levels_out(desc.width, u64::from(desc.height), short_side(), drop_always(), true)
+}
+
+/// The level every host copy of the placed texture `desc` begins at at
+/// least, room or not (`VICTORY_TEXTURE_DROP_MIPS`, [`drop_always`]): 0
+/// without it.
+#[cfg(windows)]
+fn floor_level(desc: &ResourceDesc) -> u32 {
+    base_level(desc, levels_out(desc.width, u64::from(desc.height), short_side(), drop_always(), false))
+}
+
+/// The levels, as a mask, of a texture `width` by `height` of `mips` levels
+/// that are at most `side` texels a side: those of a texture made level by
+/// level (`crate::tiles`) that are given the card's memory while it is
+/// short of room ([`room_for_short`]), as [`ShortOfRoom`] makes other copies
+/// without the larger ones. It is shown from them until the others get
+/// theirs, instead of not at all.
+#[cfg(any(windows, test))]
+fn small_levels(width: u64, height: u64, mips: u32, side: u64) -> u32 {
+    (0..mips.min(32))
+        .filter(|&level| (width >> level).max(height >> level) <= side)
+        .fold(0, |mask, level| mask | 1 << level)
+}
+
+/// Once the card has room (`room`), the host copy of the placed texture
+/// `this` made short of room ([`ShortOfRoom`]) is replaced by one as whole
+/// as its views want, as [`want_level`] replaces one: made and filled at the
+/// next use (the texture pass, right after this), and the slots that show
+/// the short one go on doing so until that upload has run. Without room it
+/// is noted to be looked at again (`crate::descriptor::host::made_short`).
+/// The copy made first stayed short for as long as it was used: the commit
+/// this is ported from (ka1qux 08fd102) replaced it only when it was let go
+/// as idle. Returns whether it was replaced.
+#[cfg(windows)]
+pub(crate) fn regrow(this: This, room: bool) -> bool {
+    use std::sync::atomic::Ordering::Relaxed;
+    if this.is_null() {
+        return false;
+    }
+    let r = resource(this);
+    if r.desc.dimension == BUFFER || !r.host.placed.load(Relaxed) {
+        return false;
+    }
+    let mut made = r.host.made.lock().unwrap_or_else(|e| e.into_inner());
+    if !made.as_ref().is_some_and(|(host, _)| host.short > 0) || crate::texture::host_wrote(this as usize) {
+        return false;
+    }
+    if !room {
+        crate::descriptor::host::made_short(r.data() as u64);
+        return false;
+    }
+    // Under the lock, as in `want_level`.
+    crate::texture::unstage(this);
+    r.host.grown.store(true, Relaxed);
+    r.host.short_next.store(false, Relaxed);
+    SHORT_MADE[3].fetch_add(1, Relaxed);
+    if let Some(old) = made.take() {
+        REPLACED.lock().unwrap_or_else(|e| e.into_inner()).push((crate::host::moment(), old));
+    }
+    true
+}
+
+/// The title's largest levels the host copy of texture `this` leaves out
+/// ([`HostTexture::base`]): 0 for buffers, for textures without a host copy
+/// and for any but those placed for views (whose copies alone leave levels
+/// out). Not a use of the texture.
+#[cfg(windows)]
+pub(crate) fn levels_left_out(this: This) -> u32 {
+    if this.is_null() {
+        return 0;
+    }
+    let r = resource(this);
+    if r.desc.dimension == BUFFER || !r.host.placed.load(std::sync::atomic::Ordering::Relaxed) {
+        return 0;
+    }
+    let made = r.host.made.lock().unwrap_or_else(|e| e.into_inner());
+    made.as_ref().map_or(0, |(host, _)| host.base)
 }
 
 /// For the card accounting line ([`card_accounting`]): the title texture
@@ -2411,6 +2681,11 @@ fn free_blocks(
             continue;
         }
         let n = host.bytes;
+        // One made short of room is made as short again while there is
+        // still none ([`regrow`] makes it whole when there is).
+        if host.short > 0 {
+            r.host.short_next.store(!room_lately(), Relaxed);
+        }
         // Under the lock, as in `want_level`.
         crate::texture::unstage(at as This);
         r.host.grown.store(true, Relaxed);
@@ -2601,6 +2876,7 @@ impl HostTexture {
             filled: false,
             tiled: None,
             base: 0,
+            short: 0,
             serial: SERIAL.fetch_add(1, Relaxed) + 1,
             grown: Default::default(),
             holds: Default::default(),
@@ -2626,6 +2902,7 @@ impl HostTexture {
             filled: false,
             tiled: Some(tiled),
             base: 0,
+            short: 0,
             serial: SERIAL.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1,
             grown: Default::default(),
             holds: Default::default(),
@@ -2900,14 +3177,27 @@ impl OnDemand {
     /// [`crate::tiles::Tiled::uploaded`]; `memory`: where the texture's
     /// title memory starts (its slots are made again if the first level
     /// they may show changed).
-    /// Held levels get tiles only while the card has room ([`room`]).
+    /// Held levels get tiles only while the card has room ([`room`]), and
+    /// the small ones while it is short of room ([`small_levels`]).
     /// Returns whether a level is still without its tiles: the caller
     /// records the upload again later.
     pub(crate) fn uploaded(&self, held: u32, memory: u64) -> bool {
         let Some(tiled) = &self.0.tiled else {
             return false;
         };
-        let (changed, waiting) = tiled.uploaded(&self.0.texture, held, room(crate::host::host().and_then(|h| h.video_memory())));
+        let card = crate::host::host().and_then(|h| h.video_memory());
+        let room = room(card);
+        let small = if room || !room_for_short(card) {
+            0
+        } else {
+            // SAFETY: a live resource.
+            let d = unsafe { self.0.texture.GetDesc() };
+            small_levels(d.Width, u64::from(d.Height), u32::from(d.MipLevels), short_side())
+        };
+        if small & held != 0 {
+            SHORT_MADE[2].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        }
+        let (changed, waiting) = tiled.uploaded(&self.0.texture, held, room, small);
         if changed {
             crate::descriptor::host::levels_changed(memory);
         }
@@ -3000,6 +3290,7 @@ fn hand_out_resource(
             placed: std::sync::atomic::AtomicBool::new(false),
             wanted: std::sync::atomic::AtomicU32::new(u32::MAX),
             grown: std::sync::atomic::AtomicBool::new(false),
+            short_next: std::sync::atomic::AtomicBool::new(false),
         },
     });
     // The host copy waits for the texture's first use ([`Hosted`]).
@@ -4920,5 +5211,95 @@ float4 lit() : SV_Target { return 1.0; }
         let d = unsafe { more.texture.GetDesc() };
         assert_eq!((more.base, d.Width, d.MipLevels), (0, 256, 9));
         assert!(more.serial != copy.serial && more.grown.load(std::sync::atomic::Ordering::Relaxed));
+    }
+
+    /// A host copy made short of room is asked to leave out the levels past
+    /// 256 texels a side; `VICTORY_TEXTURE_DROP_MIPS` ones of a texture of
+    /// 512 texels a side or more, room or not.
+    #[test]
+    fn levels_left_out_for_want_of_room() {
+        assert_eq!(levels_past(256, 256, 256), 0);
+        assert_eq!(levels_past(2048, 2048, 256), 3);
+        assert_eq!(levels_past(2048, 512, 256), 3);
+        assert_eq!(levels_past(300, 100, 256), 1);
+        assert_eq!(levels_past(1, 1, 16), 0);
+        assert_eq!(levels_out(2048, 2048, 256, 0, false), 0);
+        assert_eq!(levels_out(2048, 2048, 256, 0, true), 3);
+        assert_eq!(levels_out(2048, 2048, 256, 4, true), 4);
+        assert_eq!(levels_out(2048, 2048, 256, 1, false), 1);
+        // Under 512 a side: none always, the short ones still.
+        assert_eq!(levels_out(1024, 256, 256, 2, false), 0);
+        assert_eq!(levels_out(1024, 256, 256, 2, true), 2);
+    }
+
+    /// Of a texture made level by level, the levels of 256 texels a side or
+    /// less get the card's memory while it is short of room.
+    #[test]
+    fn the_small_levels_of_a_texture_made_level_by_level() {
+        // 2048 by 2048, 12 levels: levels 3 (256) to 11 (1).
+        assert_eq!(small_levels(2048, 2048, 12, 256), 0b1111_1111_1000);
+        assert_eq!(small_levels(256, 128, 9, 256), 0x1ff);
+        assert_eq!(small_levels(4096, 1024, 4, 256), 0);
+    }
+
+    /// Short copies are made under the higher line as [`room`] counts the
+    /// card, and never past its hard ceiling as the system counts it.
+    #[test]
+    fn short_copies_stop_at_the_hard_ceiling() {
+        const MB: u64 = 1 << 20;
+        // A budget of 14.6 GB (the 9060 XT's in session play52): 95 % is
+        // 13,870 MB, 97 % 14,162 MB.
+        let budget = 14_600 * MB;
+        assert!(under_short_line(budget, 13_000 * MB, 13_500 * MB, 97, 95));
+        assert!(!under_short_line(budget, 13_000 * MB, 14_200 * MB, 97, 95));
+        // Under the higher line as counted, past the ceiling as the system
+        // counts it: none.
+        assert!(!under_short_line(budget, 13_900 * MB, 13_000 * MB, 97, 95));
+        // A ceiling of 100: the higher line alone.
+        assert!(under_short_line(budget, 13_900 * MB, 13_000 * MB, 97, 100));
+        assert!(!under_short_line(0, 0, 0, 97, 95));
+    }
+
+    /// A placed texture made short of room has a host copy of its levels of
+    /// 256 texels a side and less; a view of its larger levels does not
+    /// replace it, the card's room does, with a whole one.
+    #[cfg(windows)]
+    #[test]
+    fn a_copy_made_short_of_room_is_made_whole_when_there_is_room() {
+        use windows_sys::Win32::System::Memory::{MEM_COMMIT, MEM_RESERVE, PAGE_READWRITE, VirtualAlloc};
+        if crate::host::host().is_none() || crate::tiles::wanted() || drop_always() != 0 || short_side() != 256 {
+            return;
+        }
+        // 1024x1024 BC7, eleven levels, 4 KiB blocks.
+        let desc = [3u32, 0, 0, 0, 1024, 0, 1024, 0xb_0001, 98, 1, 0, 0x105, 0, 0];
+        let whole = placed_bytes(&desc).unwrap();
+        // SAFETY: memory of our own that stays.
+        let at = unsafe { VirtualAlloc(std::ptr::null(), whole as usize, MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE) };
+        let texture = texture_at(at as u64, &desc).unwrap();
+        let copy = {
+            let _short = ShortOfRoom::begin();
+            host_copy(texture).unwrap()
+        };
+        // SAFETY: a live texture.
+        let d = unsafe { copy.texture.GetDesc() };
+        assert_eq!((copy.base, copy.short, d.Width, d.Height, d.MipLevels), (2, 2, 256, 256, 9));
+        assert_eq!(levels_left_out(texture), 2);
+        // Made on, out of the short time: the same copy.
+        assert_eq!(host_copy(texture).unwrap().serial, copy.serial);
+        // A view of the title's first level asks for no more of it.
+        want_level(texture, 0);
+        assert_eq!(host_copy(texture).unwrap().serial, copy.serial);
+        // Without room it stays.
+        assert!(!regrow(texture, false));
+        assert_eq!(host_copy(texture).unwrap().serial, copy.serial);
+        // With room: a whole one, whose upload makes the slots again.
+        assert!(regrow(texture, true));
+        let more = host_copy(texture).unwrap();
+        // SAFETY: as above.
+        let d = unsafe { more.texture.GetDesc() };
+        assert_eq!((more.base, more.short, d.Width, d.MipLevels), (0, 0, 1024, 11));
+        assert!(more.serial != copy.serial && more.grown.load(std::sync::atomic::Ordering::Relaxed));
+        assert_eq!(levels_left_out(texture), 0);
+        assert!(!regrow(texture, true));
     }
 }

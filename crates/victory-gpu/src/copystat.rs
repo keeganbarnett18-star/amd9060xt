@@ -769,7 +769,10 @@ fn log_memory() {
          host copies the host renders to or writes: {} alive {:.0} MB; host copies the title \
          fills: {} alive {:.0} MB ({} of them placed), {} let go {:.0} MB and {} made again \
          {:.0} MB since the start; {} host copies made in all; passes that made none for lack of \
-         room: {}; the card: {:.0} MB in use of a budget of {:.0} MB, {:.0} MB of the PC's memory \
+         room: {}, slots refused for it {}, slots made without their largest levels for it {} ({} \
+         such host copies, {:.0} MB; {} replaced by whole ones once there was room, {} slots looked \
+         at again for that; uploads of textures made level by level given only their small levels \
+         for it {}); the card: {:.0} MB in use of a budget of {:.0} MB, {:.0} MB of the PC's memory \
          shared with it in use",
         census[2],
         mb(census[3]),
@@ -784,6 +787,13 @@ fn log_memory() {
         mb(kinds[5]),
         kinds[6],
         crate::draw::HEAP_TEXTURES_FULL.load(Relaxed),
+        crate::draw::HEAP_TEXTURES_REFUSED.load(Relaxed),
+        crate::draw::HEAP_TEXTURES_SHORT.load(Relaxed),
+        crate::resource::SHORT_MADE[0].load(Relaxed),
+        mb(crate::resource::SHORT_MADE[1].load(Relaxed)),
+        crate::resource::SHORT_MADE[3].load(Relaxed),
+        crate::resource::SHORT_MADE[4].load(Relaxed),
+        crate::resource::SHORT_MADE[2].load(Relaxed),
         mb(card[1]),
         mb(card[0]),
         mb(card[3]),

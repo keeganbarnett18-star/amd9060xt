@@ -750,6 +750,11 @@ pub(crate) static HEAP_TEXTURES_WAITING: AtomicU64 = AtomicU64::new(0);
 /// Passes that made no texture because the card had no room
 /// (`crate::resource::room`), for the memory line.
 pub(crate) static HEAP_TEXTURES_FULL: AtomicU64 = AtomicU64::new(0);
+/// Since the start, for the memory line: slots not made because the card
+/// had no room, and slots made while it had none, without their largest
+/// levels (`crate::resource::ShortOfRoom`).
+pub(crate) static HEAP_TEXTURES_REFUSED: AtomicU64 = AtomicU64::new(0);
+pub(crate) static HEAP_TEXTURES_SHORT: AtomicU64 = AtomicU64::new(0);
 
 /// Frames after a whole upload of a texture picked by index at which its
 /// memory is looked at again, each counted from the look before.
@@ -2587,6 +2592,10 @@ impl State {
             once!("textures picked by index: the card has no room for more; they wait");
         }
         let mut refused = 0;
+        // Whether a slot refused for want of room is made without its
+        // largest levels instead (`resource::room_for_short`): asked at the
+        // first such slot, and again as `room` is.
+        let mut short_room: Option<bool> = None;
         // Room again: the slots held back while the card was full are due
         // now (`full_card_pass`).
         if room {
@@ -2610,6 +2619,9 @@ impl State {
         // without the card's memory are uploaded again.
         if room {
             host.texture_slots_waiting(frame);
+            // And the slots of textures made short of room, whose copies
+            // are made whole below (`resource::regrow`).
+            host.texture_slots_regrow(frame);
         }
         // And those whose host copy was moved out of a block being emptied.
         host.texture_slots_moved(frame);
@@ -2826,11 +2838,24 @@ impl State {
             // had its colour only in the launches that entered the world
             // under the line. `VICTORY_REUPLOAD_WHEN_FULL=0`: refused, as
             // before.
+            // Not whole, then: without its largest levels, up to a higher
+            // line (`resource::ShortOfRoom`, after ka1qux 08fd102). Not for
+            // a bake, which keeps what it samples: refused as before.
+            let mut short = false;
             if !room {
                 let has_its_texture = reupload_when_full()
                     && heap.handle(index).is_some_and(|handle| host.texture_slot_made_from(index, handle));
-                if !has_its_texture {
+                short = !has_its_texture
+                    && !baking
+                    && sync.is_none()
+                    && *short_room.get_or_insert_with(|| {
+                        crate::resource::room_for_short(crate::host::host().and_then(|h| h.video_memory()))
+                    });
+                if short {
+                    HEAP_TEXTURES_SHORT.fetch_add(1, Ordering::Relaxed);
+                } else if !has_its_texture {
                     refused += 1;
+                    HEAP_TEXTURES_REFUSED.fetch_add(1, Ordering::Relaxed);
                     if full_card_pass() {
                         // Held back for the frames of about four seconds
                         // (`most`), or until the card has room; the pass
@@ -2844,15 +2869,20 @@ impl State {
                     }
                     continue;
                 }
-                let n = HEAP_TEXTURES_REUPLOADED_FULL.fetch_add(1, Ordering::Relaxed) + 1;
-                if n == 1 || n.is_multiple_of(500) {
-                    tracing::info!(
-                        so_far = n,
-                        slot = index,
-                        "a texture already on the card is brought up to date although the card has no room for new ones"
-                    );
+                if has_its_texture {
+                    let n = HEAP_TEXTURES_REUPLOADED_FULL.fetch_add(1, Ordering::Relaxed) + 1;
+                    if n == 1 || n.is_multiple_of(500) {
+                        tracing::info!(
+                            so_far = n,
+                            slot = index,
+                            "a texture already on the card is brought up to date although the card has no room for new ones"
+                        );
+                    }
                 }
             }
+            // For the rest of this slot's turn: a host copy made here is
+            // made without its largest levels.
+            let _short = short.then(crate::resource::ShortOfRoom::begin);
             // Gate new host texture creation / staging on commit reserve after
             // `mapped == 0` reclamation (`texture_slot_gone`) has run, and
             // before mirroring a slot to an unuploaded texture.
@@ -2904,6 +2934,10 @@ impl State {
                     continue;
                 }
             };
+            // A host copy made short of room is replaced by a whole one now
+            // that the card has room, made and uploaded here; without room
+            // it is looked at again later (not for a bake, as above).
+            crate::resource::regrow(resource, room && !baking && !sync_bake);
             let texture = crate::resource::host_resource(resource);
             if crate::residency::upload_refused() {
                 served = false;
@@ -3072,9 +3106,15 @@ impl State {
             crate::texture::unstage(resource);
             SPENT.fetch_add(bytes, Ordering::Relaxed);
             since_asked += bytes;
-            if room && since_asked >= 32 << 20 {
+            if since_asked >= 32 << 20 && (room || short_room == Some(true)) {
                 since_asked = 0;
-                room = crate::resource::room(crate::host::host().and_then(|h| h.video_memory()));
+                let memory = crate::host::host().and_then(|h| h.video_memory());
+                if room {
+                    room = crate::resource::room(memory);
+                } else {
+                    // (Short copies take the card's memory too.)
+                    short_room = Some(crate::resource::room_for_short(memory));
+                }
             }
             HEAP_TEXTURE_BYTES.fetch_add(bytes, Ordering::Relaxed);
             HEAP_TEXTURES.fetch_add(1, Ordering::Relaxed);

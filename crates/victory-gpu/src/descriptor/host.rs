@@ -505,6 +505,20 @@ pub(crate) fn moved(start: u64) {
     MOVED.lock().unwrap_or_else(|e| e.into_inner()).insert(start, crate::host::moment());
 }
 
+/// Placed textures (by the start of their memory) whose host copy was made
+/// without its largest levels for want of room (`crate::resource`
+/// `ShortOfRoom`), and since when: once the card has room their slots are
+/// made due again, so the pass replaces the copy by a whole one
+/// (`crate::resource::regrow`) and the slots are made from it once it is
+/// uploaded ([`HostHeap::texture_slots_regrow`]).
+static SHORT_OF_ROOM: Mutex<std::collections::BTreeMap<u64, u64>> = Mutex::new(std::collections::BTreeMap::new());
+
+/// The host copy of the placed texture at `start` was made short of room
+/// (or still is, and its slots were looked at without room).
+pub(crate) fn made_short(start: u64) {
+    SHORT_OF_ROOM.lock().unwrap_or_else(|e| e.into_inner()).entry(start).or_insert_with(crate::host::moment);
+}
+
 /// The last upload of the placed texture at `start` left a held level
 /// without tiles. A texture picked by index is uploaded once and then
 /// only when its memory is found changed, and its staging buffer goes
@@ -2083,7 +2097,7 @@ impl HostHeap {
     /// how many slots it made due.
     /// shortcut: kept in one place for all heaps, as the starts below.
     pub(crate) fn texture_slots_waiting(&self, frame: u64) -> usize {
-        self.texture_slots_from(&WAITING, frame)
+        self.texture_slots_from(&WAITING, frame, &crate::tiles::STATS[10])
     }
 
     /// The same for placed textures whose host copy was moved out of a
@@ -2091,10 +2105,23 @@ impl HostHeap {
     /// takes no more of the card than the old one, which goes once the
     /// slots are made from the new one.
     pub(crate) fn texture_slots_moved(&self, frame: u64) -> usize {
-        self.texture_slots_from(&MOVED, frame)
+        self.texture_slots_from(&MOVED, frame, &crate::tiles::STATS[10])
     }
 
-    fn texture_slots_from(&self, from: &Mutex<std::collections::BTreeMap<u64, u64>>, frame: u64) -> usize {
+    /// The same for placed textures whose host copy was made short of room
+    /// ([`made_short`]), only while the card has room: the pass replaces
+    /// the copy by a whole one (`crate::resource::regrow`), [`Self::WAITING_A_PASS`]
+    /// textures a pass at most, and asks again for room as it uploads.
+    pub(crate) fn texture_slots_regrow(&self, frame: u64) -> usize {
+        self.texture_slots_from(&SHORT_OF_ROOM, frame, &crate::resource::SHORT_MADE[4])
+    }
+
+    fn texture_slots_from(
+        &self,
+        from: &Mutex<std::collections::BTreeMap<u64, u64>>,
+        frame: u64,
+        counted: &std::sync::atomic::AtomicU64,
+    ) -> usize {
         if self.sampler {
             return 0;
         }
@@ -2128,7 +2155,7 @@ impl HostHeap {
         for &slot in &slots {
             textures.changed(slot, frame, frame + 1);
         }
-        crate::tiles::STATS[10].fetch_add(slots.len() as u64, std::sync::atomic::Ordering::Relaxed);
+        counted.fetch_add(slots.len() as u64, std::sync::atomic::Ordering::Relaxed);
         slots.len()
     }
 
@@ -4518,18 +4545,37 @@ fn make_twinned(
 /// The view `desc` of a texture, of a host copy of its levels from `base`
 /// on (`crate::resource::held_only`). What it shows of larger ones, if any,
 /// is left out.
+/// Also of a copy made without its largest levels for want of room
+/// (`crate::resource::ShortOfRoom`), whose texture the title may view as an
+/// array of one layer too: such a view kept its first level, past the
+/// copy's own (ka1qux 08fd102 moved both kinds down).
 fn from_base(desc: &mut D3D12_SHADER_RESOURCE_VIEW_DESC, base: u32) {
-    if desc.ViewDimension != D3D12_SRV_DIMENSION_TEXTURE2D {
-        return;
-    }
     // SAFETY: the member its dimension says.
-    let t = unsafe { &mut desc.Anonymous.Texture2D };
-    let lost = base.saturating_sub(t.MostDetailedMip);
-    t.MostDetailedMip = t.MostDetailedMip.saturating_sub(base);
-    if t.MipLevels != u32::MAX {
-        t.MipLevels = t.MipLevels.saturating_sub(lost).max(1);
+    unsafe {
+        match desc.ViewDimension {
+            D3D12_SRV_DIMENSION_TEXTURE2D => {
+                let t = &mut desc.Anonymous.Texture2D;
+                shift_levels(base, &mut t.MostDetailedMip, &mut t.MipLevels, &mut t.ResourceMinLODClamp);
+            }
+            D3D12_SRV_DIMENSION_TEXTURE2DARRAY => {
+                let t = &mut desc.Anonymous.Texture2DArray;
+                shift_levels(base, &mut t.MostDetailedMip, &mut t.MipLevels, &mut t.ResourceMinLODClamp);
+            }
+            _ => {}
+        }
     }
-    t.ResourceMinLODClamp = (t.ResourceMinLODClamp - base as f32).max(0.0);
+}
+
+/// [`from_base`] of a view's first level, its count of levels (`u32::MAX`:
+/// all from the first) and its least level of detail: moved down by `base`,
+/// one level left at least.
+fn shift_levels(base: u32, first: &mut u32, levels: &mut u32, clamp: &mut f32) {
+    let lost = base.saturating_sub(*first);
+    *first = first.saturating_sub(base);
+    if *levels != u32::MAX {
+        *levels = levels.saturating_sub(lost).max(1);
+    }
+    *clamp = (*clamp - base as f32).max(0.0);
 }
 
 /// Writes of a slot with another view of the placed texture it showed,
@@ -5009,6 +5055,38 @@ mod tests {
         assert_eq!(view(5, u32::MAX, 5.5), (2, u32::MAX, 2.5));
         // (Two levels the copy has not.)
         assert_eq!(view(1, 4, 0.0), (0, 2, 0.0));
+    }
+
+    /// A view of a texture whose host copy left its largest levels out for
+    /// want of room moves down by them, as an array of one layer too; a
+    /// copy that leaves none out shows the view as the title gave it.
+    #[test]
+    fn views_move_down_by_the_levels_left_out_for_want_of_room() {
+        let moved = |base, first, levels, clamp| {
+            let (mut f, mut l, mut c) = (first, levels, clamp);
+            shift_levels(base, &mut f, &mut l, &mut c);
+            (f, l, c)
+        };
+        assert_eq!(moved(0, 3, 2, 1.0), (3, 2, 1.0));
+        assert_eq!(moved(2, 0, u32::MAX, 0.0), (0, u32::MAX, 0.0));
+        // A 2048 by 2048 texture of 12 levels made 256 by 256 (3 left out):
+        // the whole chain is its 9 levels.
+        assert_eq!(moved(3, 0, 12, 0.0), (0, 9, 0.0));
+        assert_eq!(moved(1, 3, 2, 2.5), (2, 2, 1.5));
+        // Every level the view shows left out: the copy's first, alone.
+        assert_eq!(moved(3, 1, 1, 0.0), (0, 1, 0.0));
+        // As an array of one layer (dimension 5: first, levels, first
+        // layer, layers, plane, clamp).
+        let mut desc = srv_desc(&[98, 5, 5768, 0, 0, u32::MAX, 0, 1, 0, 0]);
+        from_base(&mut desc, 2);
+        // SAFETY: the member its dimension says.
+        let t = unsafe { desc.Anonymous.Texture2DArray };
+        assert_eq!((t.MostDetailedMip, t.MipLevels, t.FirstArraySlice, t.ArraySize), (0, u32::MAX, 0, 1));
+        let mut desc = srv_desc(&[98, 5, 5768, 0, 4, 3, 0, 1, 0, 0]);
+        from_base(&mut desc, 2);
+        // SAFETY: as above.
+        let t = unsafe { desc.Anonymous.Texture2DArray };
+        assert_eq!((t.MostDetailedMip, t.MipLevels, t.ArraySize), (2, 3, 1));
     }
 
     /// 2D textures and arrays have a neutral stand-in, others a null view.
