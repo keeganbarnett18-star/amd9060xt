@@ -208,8 +208,11 @@ fork's constant.
 | `VICTORY_AMBIENT=constant:<level>` | the same light everywhere |
 | `VICTORY_AMBIENT_SHADE=<strength>,<metres>` | the creases (1,0.6) |
 | `VICTORY_AMBIENT_AIR=<multiple>` | what the air scatters is bounded by a multiple of the light around (off: the brown veil in the day room stays with it, light-14) |
+| `VICTORY_AMBIENT_RT=<least>,<most>[,<level>]` | with the builder: the title's traced diffuse light is kept between `least` and `most` times the stand-in's (level 0.8 if `VICTORY_AMBIENT` is unset); a top of 2 took away white blotches on an RX 9060 XT (avatarmanz 77137b98) |
 
-It is off while the builder runs.
+It is off while the builder runs (once all its pipelines are made), unless
+`VICTORY_AMBIENT_RT` asks for the band; then only the diffuse light is
+bounded, and the air's bound and the reflections' floor and cap stay off.
 
 ## Where to look
 

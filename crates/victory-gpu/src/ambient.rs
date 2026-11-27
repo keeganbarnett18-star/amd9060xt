@@ -131,16 +131,78 @@ fn parse(set: &str) -> Set {
 
 fn set() -> Set {
     static SET: OnceLock<Set> = OnceLock::new();
-    *SET.get_or_init(|| parse(&std::env::var("VICTORY_AMBIENT").unwrap_or_default()))
+    *SET.get_or_init(|| match parse(&std::env::var("VICTORY_AMBIENT").unwrap_or_default()) {
+        // With the band asked for and no share, the band's level.
+        Set::Off => rt_band().map_or(Set::Off, |b| Set::Estimate(b.level)),
+        set => set,
+    })
+}
+
+/// With ray tracing (`VICTORY_AMBIENT_RT=<least>,<most>[,<level>]`; unset:
+/// off, the title's own light whenever the builder runs): the diffuse light
+/// the title's resolve leaves is kept between `least` and `most` times the
+/// stand-in's light (level: the share of the estimate when `VICTORY_AMBIENT`
+/// is not set, 0.8). With the builder running the title's traced diffuse
+/// light flickers and goes black indoors (the diner of the opening: walls and
+/// ceiling black under lit lamps) while the structures its rays walk are
+/// partly wrong: its detail stays inside the band, its swings and black rooms
+/// do not. On an RX 9060 XT a top of 2 took away white blotches the traced
+/// light left.
+///
+/// From avatarmanz/VIctory-7900XTX 77137b98 (GPL-3.0-or-later), onto our
+/// stand-in: with `constant:<level>` the constant is what the band is of
+/// (without rays it is the light, as before); `VICTORY_AMBIENT_MOST`/
+/// `LEAST` still bound the estimate; and with rays the air's bound and the
+/// reflections' floor and cap stay off (`after`): they stand in for what
+/// rays that find nothing leave, and would dim traced reflections.
+#[derive(Clone, Copy, PartialEq, Debug)]
+pub(crate) struct Band {
+    least: f32,
+    most: f32,
+    level: f32,
+}
+
+pub(crate) fn rt_band() -> Option<Band> {
+    static SET: OnceLock<Option<Band>> = OnceLock::new();
+    *SET.get_or_init(|| {
+        let band = parse_band(&std::env::var("VICTORY_AMBIENT_RT").ok()?)?;
+        tracing::info!(least = band.least, most = band.most, level = band.level, "the stand-in keeps the traced indirect light in a band (VICTORY_AMBIENT_RT)");
+        Some(band)
+    })
+}
+
+fn parse_band(set: &str) -> Option<Band> {
+    let mut parts = set.split(',').map(|p| p.trim().parse::<f32>().ok().filter(|v| v.is_finite() && *v >= 0.0));
+    let least = parts.next().flatten()?;
+    let most = parts.next().flatten().unwrap_or(4.0).max(least).max(1e-3);
+    let level = parts.next().flatten().filter(|v| *v > 0.0).unwrap_or(0.8);
+    Some(Band { least, most, level })
+}
+
+/// Whether the title's rays have structures to find: the builder has run
+/// whole (`crate::pipeline::builder_whole`, which makes nothing).
+fn rays() -> bool {
+    crate::pipeline::builder_whole()
+}
+
+/// The title's leftover light is kept between these multiples of the
+/// stand-in's: with rays, the band's; without, at least it and at most four
+/// times it (as before).
+fn bounds() -> (f32, f32) {
+    match rt_band() {
+        Some(b) if rays() => (b.least, b.most),
+        _ => (1.0, 4.0),
+    }
 }
 
 /// Whether the stand-in is on: set, and the title's rays find nothing (the
 /// structure builder has not run whole: off, or its pipelines not all made
 /// yet). Asked at the dispatch of the probes' resolve: makes nothing there
 /// (`builder_whole`, not `builder_runs`), so a recording thread does not
-/// wait for the builder's pipelines (notquiteog/victory-nvidia 3f8d7ecb).
+/// wait for the builder's pipelines (notquiteog/victory-nvidia 3f8d7ecb). Or
+/// the band is asked for with rays (`VICTORY_AMBIENT_RT`).
 pub(crate) fn on() -> bool {
-    set() != Set::Off && !crate::pipeline::builder_whole()
+    set() != Set::Off && (rt_band().is_some() || !rays())
 }
 
 /// The most the air scatters, as a multiple of the light around
@@ -197,7 +259,7 @@ fn shade() -> [f32; 2] {
 }
 
 const SOURCE: &str = r#"
-#define RS "RootConstants(num32BitConstants=15, b0), DescriptorTable(SRV(t0)), DescriptorTable(UAV(u0)), UAV(u1), UAV(u2)"
+#define RS "RootConstants(num32BitConstants=17, b0), DescriptorTable(SRV(t0)), DescriptorTable(UAV(u0)), UAV(u1), UAV(u2)"
 #define CX 64
 #define CY 36
 #define CELLS (CX * CY)
@@ -208,6 +270,9 @@ cbuffer Set : register(b0) {
     float near; float tan_y; uint width; uint height;
     float follow; float most; float air; float ceiling;
     float floor_; float reflect_most; float reflect_least;
+    // The band with rays (`VICTORY_AMBIENT_RT`): the least part of the
+    // stand-in's light kept, and whether rays find structures (1) or not.
+    float lowest; uint rays;
 };
 Texture2D<float> depth : register(t0);
 // Cells: the light they send out (then, at CELLS, the slow mean), from
@@ -391,47 +456,53 @@ void raise(uint3 at : SV_DispatchThreadID) {
     float3 found;
     if (constant > 0.0) {
         found = float3(1.0, 0.98, 0.94) * constant * open;
-        light[p] = pack(found);
-        return;
+        // Without rays the constant is the light; with them it is what the
+        // band is of (`VICTORY_AMBIENT_RT`).
+        if (rays == 0u) {
+            light[p] = pack(found);
+            return;
+        }
+    } else {
+        // Between the four points around, those at its own depth first; which
+        // four is dithered a little.
+        float2 g = (float2(p) + 0.5) / size * float2(PX, PY) - 0.5 + (noise - 0.5) * 0.5;
+        int2 g0 = int2(floor(g));
+        float2 f = g - float2(g0);
+        float4 sr = 0, sg = 0, sb = 0;
+        float sum = 0;
+        for (int k = 0; k < 4; k++) {
+            int2 q = clamp(g0 + int2(k & 1, k >> 1), int2(0, 0), int2(PX, PY) - 1);
+            float z = seen(int2((float2(q) + 0.5) * size / float2(PX, PY)), size).z;
+            float2 b = float2(k & 1 ? f.x : 1 - f.x, k >> 1 ? f.y : 1 - f.y);
+            float w = (b.x * b.y + 1e-3) / (0.02 + abs(z - c.z) / c.z);
+            uint at0 = (q.y * PX + q.x) * 3;
+            sr += w * points[at0];
+            sg += w * points[at0 + 1];
+            sb += w * points[at0 + 2];
+            sum += w;
+        }
+        float3 all = float3(sr.w, sg.w, sb.w) / sum;
+        found = all + 1.2 * float3(dot(sr.xyz, n), dot(sg.xyz, n), dot(sb.xyz, n)) / sum;
+        found = clamp(found, 0.2 * all, 2.5 * all);
+        found = lerp(found, cells[CELLS].rgb, 0.2) * level * open;
+        // No brighter than the ceiling (`VICTORY_AMBIENT_MOST`): a bright
+        // doorway filling the view raises the cells, not the room past it.
+        float lum = dot(found, LUMA);
+        if (ceiling > 0.0 && lum > ceiling * open) found *= ceiling * open / lum;
+        // No darker than the floor (`VICTORY_AMBIENT_LEAST`): shade outdoors in
+        // the day was all but black with the estimate alone (session play51);
+        // what is missing is made up in the constant's tint.
+        lum = dot(found, LUMA);
+        if (floor_ > 0.0 && lum < floor_ * open) found += float3(1.0, 0.98, 0.94) * (floor_ * open - lum);
     }
-    // Between the four points around, those at its own depth first; which
-    // four is dithered a little.
-    float2 g = (float2(p) + 0.5) / size * float2(PX, PY) - 0.5 + (noise - 0.5) * 0.5;
-    int2 g0 = int2(floor(g));
-    float2 f = g - float2(g0);
-    float4 sr = 0, sg = 0, sb = 0;
-    float sum = 0;
-    for (int k = 0; k < 4; k++) {
-        int2 q = clamp(g0 + int2(k & 1, k >> 1), int2(0, 0), int2(PX, PY) - 1);
-        float z = seen(int2((float2(q) + 0.5) * size / float2(PX, PY)), size).z;
-        float2 b = float2(k & 1 ? f.x : 1 - f.x, k >> 1 ? f.y : 1 - f.y);
-        float w = (b.x * b.y + 1e-3) / (0.02 + abs(z - c.z) / c.z);
-        uint at0 = (q.y * PX + q.x) * 3;
-        sr += w * points[at0];
-        sg += w * points[at0 + 1];
-        sb += w * points[at0 + 2];
-        sum += w;
-    }
-    float3 all = float3(sr.w, sg.w, sb.w) / sum;
-    found = all + 1.2 * float3(dot(sr.xyz, n), dot(sg.xyz, n), dot(sb.xyz, n)) / sum;
-    found = clamp(found, 0.2 * all, 2.5 * all);
-    found = lerp(found, cells[CELLS].rgb, 0.2) * level * open;
-    // No brighter than the ceiling (`VICTORY_AMBIENT_MOST`): a bright
-    // doorway filling the view raises the cells, not the room past it.
-    float lum = dot(found, LUMA);
-    if (ceiling > 0.0 && lum > ceiling * open) found *= ceiling * open / lum;
-    // No darker than the floor (`VICTORY_AMBIENT_LEAST`): shade outdoors in
-    // the day was all but black with the estimate alone (session play51);
-    // what is missing is made up in the constant's tint.
-    lum = dot(found, LUMA);
-    if (floor_ > 0.0 && lum < floor_ * open) found += float3(1.0, 0.98, 0.94) * (floor_ * open - lum);
     float3 was = unpack(light[p]);
     // What the program left counts as far as it can be true: the sky's light
-    // outdoors, not the blocks of other memory.
+    // outdoors, not the blocks of other memory. With rays, between the
+    // band's least and most parts of it.
     float top = max(dot(found, LUMA) * most, 1e-6);
     float has = dot(was, LUMA);
     was *= min(1.0, top / max(has, 1e-6));
-    light[p] = pack(max(was, found));
+    light[p] = pack(max(was, found * lowest));
 }
 #endif
 "#;
@@ -470,7 +541,7 @@ fn make(device: &ID3D12Device, buffer: impl Fn(u64) -> Option<ID3D12Resource>) -
                 root = Some(crate::rootsig::make(
                     device,
                     &[
-                        Param::Constants { register: 0, count: 15 },
+                        Param::Constants { register: 0, count: 17 },
                         Param::SrvTable { register: 0, count: 1, visibility: D3D12_SHADER_VISIBILITY_ALL },
                         Param::UavTable { register: 0, count: 1 },
                         Param::Uav(1),
@@ -568,6 +639,12 @@ pub(crate) fn after(list: &HostList, role: Role, views: &Views) -> bool {
     if role == Role::Reflect && reflect_hold() == [0.0, 0.0] {
         return false;
     }
+    // With rays (the band, `VICTORY_AMBIENT_RT`) the air and the reflections
+    // are the title's: their bounds stand in for rays that find nothing.
+    let rays = rays();
+    if rays && matches!(role, Role::Air | Role::Reflect) {
+        return false;
+    }
     static SAID: Mutex<u32> = Mutex::new(0);
     {
         let mut said = SAID.lock().unwrap_or_else(|e| e.into_inner());
@@ -580,20 +657,23 @@ pub(crate) fn after(list: &HostList, role: Role, views: &Views) -> bool {
     list.keep(&pass.points);
     let [strength, radius] = shade();
     let floats = [level, constant, strength, radius, 0.1, 0.45];
-    let mut words = [0u32; 15];
+    let mut words = [0u32; 17];
     for (to, v) in words.iter_mut().zip(floats) {
         *to = v.to_bits();
     }
     words[6] = views.size[0];
     words[7] = views.size[1];
     words[8] = 0.04f32.to_bits();
-    words[9] = 4.0f32.to_bits();
+    let (lowest, most) = bounds();
+    words[9] = most.to_bits();
     words[10] = air().to_bits();
     words[11] = ceiling().to_bits();
     words[12] = least().to_bits();
     let [reflect_most, reflect_least] = reflect_hold();
     words[13] = reflect_most.to_bits();
     words[14] = reflect_least.to_bits();
+    words[15] = lowest.to_bits();
+    words[16] = u32::from(rays && rt_band().is_some());
     let l = &list.list;
     // SAFETY: an open list with the heap of the views set; the title's
     // program has just used both views, so their textures are in the states
@@ -601,7 +681,7 @@ pub(crate) fn after(list: &HostList, role: Role, views: &Views) -> bool {
     unsafe {
         uav_barrier(l);
         l.SetComputeRootSignature(&pass.root);
-        l.SetComputeRoot32BitConstants(0, 15, words.as_ptr().cast(), 0);
+        l.SetComputeRoot32BitConstants(0, 17, words.as_ptr().cast(), 0);
         l.SetComputeRootDescriptorTable(1, views.depth);
         l.SetComputeRootDescriptorTable(2, views.image);
         l.SetComputeRootUnorderedAccessView(3, pass.cells.GetGPUVirtualAddress());
@@ -644,6 +724,17 @@ mod tests {
         assert_eq!(parse("0.8"), Set::Estimate(0.8));
         assert_eq!(parse("constant:0.3"), Set::Constant(0.3));
         assert_eq!(parse("constant:nan"), Set::Off);
+    }
+
+    #[test]
+    fn the_band_with_rays() {
+        assert_eq!(parse_band("0.5,1.5"), Some(Band { least: 0.5, most: 1.5, level: 0.8 }));
+        assert_eq!(parse_band("1,1,0.6"), Some(Band { least: 1.0, most: 1.0, level: 0.6 }));
+        // The top is never under the floor; a missing top is four times.
+        assert_eq!(parse_band("2,1"), Some(Band { least: 2.0, most: 2.0, level: 0.8 }));
+        assert_eq!(parse_band("0.7"), Some(Band { least: 0.7, most: 4.0, level: 0.8 }));
+        assert_eq!(parse_band(""), None);
+        assert_eq!(parse_band("x,1"), None);
     }
 
     #[test]
