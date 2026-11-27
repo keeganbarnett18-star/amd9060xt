@@ -818,6 +818,13 @@ fn log_memory() {
             crate::pool::texture_classes()[3]
         );
         tracing::info!(
+            "past the card's ceiling, with room only inside the blocks of textures (VICTORY_TEXTURE_HOLES=0: nothing is made there), since the start: {} slots made whole from a hole; {} textures cut from holes with no block made for them, {} that fit none and got memory of their own; the largest hole now {} MB",
+            crate::draw::HEAP_TEXTURES_IN_HOLES.load(Relaxed),
+            crate::pool::IN_HOLES[0].load(Relaxed),
+            crate::pool::IN_HOLES[1].load(Relaxed),
+            crate::pool::largest_hole() >> 20
+        );
+        tracing::info!(
             "memory in blocks (VICTORY_TEXTURE_POOL=0 turns them off): {textures} MB of textures ({held} MB of them held), {staging} MB of their staging buffers; emptied to stay under the card's budget (VICTORY_FREE_BLOCKS=0: not) since the start: {blocks} blocks drained, {copies} host copies moved out of them, {drained} blocks emptied"
         );
     }

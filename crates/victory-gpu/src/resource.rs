@@ -1735,6 +1735,50 @@ fn texture_floor_bytes(vram_budget: Option<u64>) -> u64 {
 /// which ended runs 20 and 24.
 #[cfg(windows)]
 pub(crate) fn room(memory: Option<[u64; 4]>) -> bool {
+    let (counted, past) = room_parts(memory);
+    counted && !past
+}
+
+/// For `draw.rs` `heap_textures`, of the card as it stands: whether whole
+/// copies have room only inside the blocks of textures, whether copies made
+/// short of room have ([`short_in_blocks`]), and whether the card's use as
+/// the system counts it is at [`hard_percent`] or past it, so that no block
+/// is to be made (all three never with `VICTORY_TEXTURE_HOLES=0`, as before).
+///
+/// Room only inside the blocks: by [`room`]'s own count (the blocks' empty
+/// room as free) there is room, but the card's use as the system counts it
+/// stands at [`hard_percent`] or past it, where [`room`] makes nothing. A
+/// texture that fits a free range of a block takes none of the card's
+/// memory and is made all the same, with no new block
+/// (`crate::pool::NoNewBlock`).
+///
+/// Session play56: the world's load left the card at 95 %, where nothing
+/// more was made; the sweep, counting as [`room`] does, saw 82 to 87 %, let
+/// go of 1.4 GB of copies and then of nothing; no block was sparse enough
+/// to be drained. For its last minute and a half 10.4 GB of blocks held
+/// 7.1 GB, the card stood at 99.7 %, and nothing was made or let go.
+#[cfg(windows)]
+pub(crate) fn holes_state(memory: Option<[u64; 4]>) -> [bool; 3] {
+    if !holes() {
+        return [false; 3];
+    }
+    let (counted, past) = room_parts(memory);
+    [counted && past, short_in_blocks(memory), past]
+}
+
+/// Whether textures that fit a hole are made past the card's ceiling
+/// ([`holes_state`]).
+#[cfg(windows)]
+fn holes() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_TEXTURE_HOLES").is_none_or(|v| v != "0"))
+}
+
+/// [`room`]'s two halves: whether the card has room as [`room`] counts it,
+/// and whether its use as the system counts it is at [`hard_percent`] of
+/// the budget or past it.
+#[cfg(windows)]
+fn room_parts(memory: Option<[u64; 4]>) -> (bool, bool) {
     use std::sync::atomic::Ordering::Relaxed;
     const WITHOUT_BUDGET: u64 = 4 << 30;
     static LIMIT: std::sync::OnceLock<Option<u64>> = std::sync::OnceLock::new();
@@ -1746,24 +1790,19 @@ pub(crate) fn room(memory: Option<[u64; 4]>) -> bool {
     // count as none: `crate::tiles`.)
     let filled = KINDS[1].load(Relaxed) + crate::tiles::given_total();
     if let Some(limit) = limit {
-        return filled < limit;
+        return (filled < limit, false);
     }
     let floor = texture_floor_bytes(memory.map(|[budget, ..]| budget));
     if filled < floor {
-        return true;
+        return (true, false);
     }
     // The card's use as the system counts it, our blocks' empty room
     // included, stays under [`hard_percent`] of the budget: in session play52
     // the line below held textures at it while the blocks had 1.7 GB empty,
     // and the card stood at 98.6 % (past the budget the system moves the
     // card's memory into the PC's).
-    if let Some([budget, used, ..]) = memory
-        && budget != 0
-        && used >= budget / 100 * hard_percent()
-    {
-        return false;
-    }
-    match memory {
+    let past = memory.is_some_and(|[budget, used, ..]| budget != 0 && used >= budget / 100 * hard_percent());
+    let counted = match memory {
         // What is kept for card copies of title buffers not made yet
         // (`crate::shadow::card_room_kept`) and for the render targets a
         // world makes in its first frame ([`targets_room_kept`]) counts as
@@ -1773,7 +1812,55 @@ pub(crate) fn room(memory: Option<[u64; 4]>) -> bool {
                 < budget / 100 * room_percent()
         }
         None => filled < WITHOUT_BUDGET,
-    }
+    };
+    (counted, past)
+}
+
+/// [`room_for_short`] as [`holes_state`]'s first is to [`room`]: whether copies
+/// made short of room have room only inside the blocks, the card's use as
+/// the system counts it being at [`short_hard_percent`] or past it.
+#[cfg(windows)]
+pub(crate) fn short_in_blocks(memory: Option<[u64; 4]>) -> bool {
+    let Some(percent) = short_percent() else {
+        return false;
+    };
+    let Some([budget, used, ..]) = memory else {
+        return false;
+    };
+    let counted =
+        used.saturating_sub(crate::pool::texture_room()) + crate::shadow::card_room_kept() + targets_room_kept();
+    holes() && budget != 0 && used >= budget / 100 * short_hard_percent() && counted < budget / 100 * percent
+}
+
+/// About how many bytes of a block the host copy of the texture a
+/// descriptor shows would take: the bytes the title's own layout gives it
+/// and a quarter more, to 64 KiB (512 KiB for one made short of room, which
+/// has no level past [`short_side`] texels a side). For asking whether a
+/// hole has room for it ([`holes_state`]) before anything is made.
+#[cfg(windows)]
+pub(crate) fn hole_for(view: &crate::descriptor::View, short: bool) -> Option<u64> {
+    use crate::descriptor::View;
+    // Only a texture the title fills is cut from a block (`make_host`).
+    let bytes = match view {
+        View::Placed(false, words, _) => {
+            // SAFETY: 56 bytes in the description's layout.
+            let desc = unsafe { words.as_ptr().cast::<ResourceDesc>().read_unaligned() };
+            if desc.dimension == BUFFER || !fills(&desc) {
+                return None;
+            }
+            footprint(&desc)?.size
+        }
+        &View::Shader(resource, _) if resource != 0 => {
+            let (_, desc) = texture_memory(resource as This)?;
+            if desc.dimension == BUFFER || !fills(&desc) {
+                return None;
+            }
+            footprint(&desc)?.size
+        }
+        _ => return None,
+    };
+    let whole = (bytes + bytes / 4).next_multiple_of(65536) + 65536;
+    Some(if short { whole.min(512 << 10) } else { whole })
 }
 
 /// The bytes of the card's memory the texture queue leaves free for
@@ -1974,6 +2061,22 @@ impl Drop for ShortOfRoom {
 /// `VICTORY_TEXTURE_BUDGET_MB`, a limit of its own.
 #[cfg(windows)]
 pub(crate) fn room_for_short(memory: Option<[u64; 4]>) -> bool {
+    let Some(percent) = short_percent() else {
+        return false;
+    };
+    let Some([budget, used, ..]) = memory else {
+        return false;
+    };
+    let counted =
+        used.saturating_sub(crate::pool::texture_room()) + crate::shadow::card_room_kept() + targets_room_kept();
+    under_short_line(budget, used, counted, percent, short_hard_percent())
+}
+
+/// The share of the card's budget, counted as [`room`] counts its use, up
+/// to which copies are made short of room ([`room_for_short`]); `None`:
+/// none are made.
+#[cfg(windows)]
+fn short_percent() -> Option<u64> {
     static PERCENT: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
     let percent = *PERCENT.get_or_init(|| {
         if std::env::var_os("VICTORY_TEXTURE_SHORT").is_some_and(|v| v == "0")
@@ -1986,12 +2089,7 @@ pub(crate) fn room_for_short(memory: Option<[u64; 4]>) -> bool {
             .and_then(|v| v.trim().parse::<u64>().ok())
             .map_or(97u64.max(room_percent()), |p| p.clamp(room_percent(), 98))
     });
-    let Some([budget, used, ..]) = memory.filter(|_| percent != 0) else {
-        return false;
-    };
-    let counted =
-        used.saturating_sub(crate::pool::texture_room()) + crate::shadow::card_room_kept() + targets_room_kept();
-    under_short_line(budget, used, counted, percent, short_hard_percent())
+    (percent != 0).then_some(percent)
 }
 
 /// Whether copies made short of room ([`ShortOfRoom`]) are made whole

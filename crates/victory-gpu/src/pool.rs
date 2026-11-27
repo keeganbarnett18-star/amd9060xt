@@ -346,17 +346,19 @@ impl<B: Clone> Pool<B> {
     /// A piece of `len` bytes and the memory it lies in, and whether that
     /// part was ever used before; `make` makes a block when none has room.
     fn take(&mut self, len: u64, align: u64, now: u64, make: impl FnMut() -> Option<B>) -> Option<(Piece, B, bool)> {
-        self.take_ripe(len, align, now, Ripe::ALL, make)
+        self.take_ripe(len, align, now, Ripe::ALL, true, make)
     }
 
     /// The same from a block that is ripe, if one has room; `make` makes one
-    /// ahead too, when few are empty.
+    /// ahead too, when few are empty. Without `grow` no block is made, for
+    /// the piece or ahead: a place in the blocks there are, or none.
     fn take_ripe(
         &mut self,
         len: u64,
         align: u64,
         now: u64,
         ripe: Ripe,
+        grow: bool,
         mut make: impl FnMut() -> Option<B>,
     ) -> Option<(Piece, B, bool)> {
         // With blocks made ahead, what would be an allocation of its own (and
@@ -370,6 +372,9 @@ impl<B: Clone> Pool<B> {
         // small texture. Existing free ranges remain usable during backoff.
         let (i, start) = match self.place(len, align, ripe, class) {
             Some(found) => found,
+            // Among another class's pieces rather than nowhere.
+            None if !grow && class != 0 => self.place(len, align, ripe, 0)?,
+            None if !grow => return None,
             None => {
                 GROWN[0].fetch_add(1, Ordering::Relaxed);
                 GROWN[1].fetch_add(len, Ordering::Relaxed);
@@ -398,7 +403,8 @@ impl<B: Clone> Pool<B> {
                 }
             }
             let empty = self.blocks.iter().flatten().filter(|b| b.free.whole(self.size)).count();
-            if empty < ripe.ahead
+            if grow
+                && empty < ripe.ahead
                 && let Some(memory) = self.grow(now, &mut make)
             {
                 self.add(memory, ripe.started);
@@ -483,6 +489,17 @@ impl<B: Clone> Pool<B> {
     fn blocks(&self) -> usize {
         self.blocks.iter().flatten().count()
     }
+
+    /// The largest free range of its ripe blocks that are not draining.
+    fn largest_hole(&self, ripe: Ripe) -> u64 {
+        self.blocks
+            .iter()
+            .flatten()
+            .filter(|b| ripe.is(b) && !b.draining)
+            .filter_map(|b| b.free.0.values().copied().max())
+            .max()
+            .unwrap_or(0)
+    }
 }
 
 /// A mapped upload buffer's memory.
@@ -511,6 +528,50 @@ pub(crate) fn texture_room() -> u64 {
 /// its index (`None`: a block let go), and the size of a block.
 pub(crate) fn texture_blocks() -> (Vec<Option<(u64, bool)>>, u64) {
     (lock(&TEXTURES).blocks.iter().map(|b| b.as_ref().map(|b| (b.held, b.draining))).collect(), texture_block())
+}
+
+thread_local! {
+    /// Textures made on this thread now are cut from the blocks there are
+    /// ([`NoNewBlock`]).
+    static NO_NEW_BLOCK: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// Since the start: textures cut from a hole while no block was to be made
+/// ([`NoNewBlock`]), and those no hole had room for (made with memory of
+/// their own, by the caller).
+pub(crate) static IN_HOLES: [AtomicU64; 2] = [const { AtomicU64::new(0) }; 2];
+
+/// While it lives, [`texture`] makes no block on this thread: a texture is
+/// cut from a free range of the blocks there are, which takes none of the
+/// card's memory, or [`texture`] gives none.
+///
+/// The card's memory in use, as the system counts it, grows by blocks, not
+/// by the textures in them. Past its ceiling (`crate::resource::room`) no
+/// texture was made at all, while the blocks had room: in session play56
+/// the card stood at 99.7 % of its budget with 3.3 GB free inside 10.4 GB
+/// of blocks, the sweep (which counts that room as free) let nothing go,
+/// and for the last minute and a half nothing was made and nothing let go.
+pub(crate) struct NoNewBlock(bool);
+
+impl NoNewBlock {
+    pub(crate) fn begin() -> NoNewBlock {
+        NoNewBlock(NO_NEW_BLOCK.replace(true))
+    }
+}
+
+impl Drop for NoNewBlock {
+    fn drop(&mut self) {
+        NO_NEW_BLOCK.set(self.0);
+    }
+}
+
+/// The largest free range of the blocks of textures a piece may be cut
+/// from now (ripe, not draining), in bytes: what [`texture`] can place
+/// without a new block ([`NoNewBlock`]).
+pub(crate) fn largest_hole() -> u64 {
+    let ripe = Ripe::now();
+    let pool = lock(&TEXTURES);
+    pool.largest_hole(ripe)
 }
 
 /// Cuts no new pieces from these blocks of textures, so that they empty as
@@ -735,14 +796,14 @@ pub(crate) unsafe fn texture(
     if info.SizeInBytes == u64::MAX {
         return None;
     }
-    #[cfg_attr(not(feature = "diagnostics"), allow(unused_variables))]
-    let (piece, heap, again) = {
+    let grow = !NO_NEW_BLOCK.get();
+    let taken = {
         let mut pool = lock(&TEXTURES);
         pool.size = texture_block();
         pool.classes = classes();
         pool
     }
-    .take_ripe(info.SizeInBytes, info.Alignment.max(1), now(), Ripe::now(), || {
+    .take_ripe(info.SizeInBytes, info.Alignment.max(1), now(), Ripe::now(), grow, || {
         let desc = D3D12_HEAP_DESC {
             SizeInBytes: texture_block(),
             Properties: D3D12_HEAP_PROPERTIES { Type: D3D12_HEAP_TYPE_DEFAULT, ..Default::default() },
@@ -762,7 +823,12 @@ pub(crate) unsafe fn texture(
             return None;
         }
         heap
-    })?;
+    });
+    if !grow {
+        IN_HOLES[usize::from(taken.is_none())].fetch_add(1, Ordering::Relaxed);
+    }
+    #[cfg_attr(not(feature = "diagnostics"), allow(unused_variables))]
+    let (piece, heap, again) = taken?;
     let mut made: Option<ID3D12Resource> = None;
     // SAFETY: the piece is no one else's; the heap lives while a piece of
     // it is taken.
@@ -905,6 +971,37 @@ mod tests {
         }
     }
 
+    /// Without a new block a piece is cut from a hole of the blocks there
+    /// are, also from one of another size class, or there is none; and no
+    /// block is made ahead.
+    #[test]
+    fn without_a_new_block_a_piece_goes_in_a_hole_or_nowhere() {
+        let mut pool: Pool<u64> = Pool::new(SPARE_KEPT);
+        pool.classes = true;
+        let made = std::cell::Cell::new(0u64);
+        let make = || {
+            made.set(made.get() + 1);
+            Some(made.get())
+        };
+        let ahead = Ripe { started: 0, finished: 0, ahead: 2 };
+        // No block yet: none is made.
+        assert!(pool.take_ripe(1 << 20, 65536, 0, ahead, false, make).is_none());
+        assert_eq!(made.get(), 0);
+        // A large piece makes a block; its hole takes a small one without
+        // a new block, though the block is of another class.
+        let (large, block, _) = pool.take_ripe(BLOCK / 4, 65536, 0, Ripe::ALL, true, make).unwrap();
+        assert_eq!(pool.largest_hole(Ripe::ALL), BLOCK - BLOCK / 4);
+        let (small, same, _) = pool.take_ripe(65536, 65536, 0, ahead, false, make).unwrap();
+        assert_eq!((same, small.block, made.get()), (block, large.block, 1));
+        // More than the largest hole: nowhere, and still one block.
+        assert!(pool.take_ripe(BLOCK, 65536, 0, ahead, false, make).is_none());
+        assert_eq!(made.get(), 1);
+        // A draining block's hole is not one.
+        pool.blocks[0].as_mut().unwrap().draining = true;
+        assert_eq!(pool.largest_hole(Ripe::ALL), 0);
+        assert!(pool.take_ripe(65536, 65536, 0, ahead, false, make).is_none());
+    }
+
     #[test]
     fn empty_blocks_stay_while_the_card_has_room() {
         assert_eq!(spares(Some([100, 84, 0, 0]), true), SPARE_KEPT);
@@ -1004,7 +1101,7 @@ mod tests {
             Some(made.get())
         };
         let at = |started, finished| Ripe { started, finished, ahead: 2 };
-        let take = |pool: &mut Pool<u64>, ripe| pool.take_ripe(BLOCK / 2, 65536, 0, ripe, make).unwrap().1;
+        let take = |pool: &mut Pool<u64>, ripe| pool.take_ripe(BLOCK / 2, 65536, 0, ripe, true, make).unwrap().1;
         // Nothing runs: at once, and two are made ahead, one a time.
         assert_eq!(take(&mut pool, at(0, 0)), 1);
         assert_eq!(made.get(), 2);
@@ -1020,7 +1117,7 @@ mod tests {
         assert_eq!(take(&mut pool, at(7, 4)), 4);
         assert_eq!(take(&mut pool, at(7, 5)), 4);
         // A whole block's worth too.
-        assert_eq!(pool.take_ripe(BLOCK, 65536, 0, at(8, 7), make).unwrap().1, 5);
+        assert_eq!(pool.take_ripe(BLOCK, 65536, 0, at(8, 7), true, make).unwrap().1, 5);
         // Off: the first with room, whatever its age, none ahead.
         let n = made.get();
         assert_eq!(pool.take(BLOCK / 2, 65536, 0, make).unwrap().1, 6);

@@ -757,6 +757,9 @@ pub(crate) static HEAP_TEXTURES_FULL: AtomicU64 = AtomicU64::new(0);
 /// levels (`crate::resource::ShortOfRoom`).
 pub(crate) static HEAP_TEXTURES_REFUSED: AtomicU64 = AtomicU64::new(0);
 pub(crate) static HEAP_TEXTURES_SHORT: AtomicU64 = AtomicU64::new(0);
+/// And slots made whole while the card had no room but inside its blocks
+/// of textures (`crate::resource::holes_state`).
+pub(crate) static HEAP_TEXTURES_IN_HOLES: AtomicU64 = AtomicU64::new(0);
 
 /// Frames after a whole upload of a texture picked by index at which its
 /// memory is looked at again, each counted from the look before.
@@ -2598,6 +2601,13 @@ impl State {
         // largest levels instead (`resource::room_for_short`): asked at the
         // first such slot, and again as `room` is.
         let mut short_room: Option<bool> = None;
+        // Without room: whether there is room inside the blocks of textures
+        // all the same, for whole copies and for short ones, and whether no
+        // block is to be made (`resource::holes_state`); and the largest
+        // hole of those blocks. Asked at the first slot that needs them,
+        // and again as `room` is and after a slot that may have cut a piece.
+        let mut holes: Option<[bool; 3]> = None;
+        let mut hole: Option<u64> = None;
         // Room again: the slots held back while the card was full are due
         // now (`full_card_pass`).
         if room {
@@ -2857,17 +2867,40 @@ impl State {
             // Not whole, then: without its largest levels, up to a higher
             // line (`resource::ShortOfRoom`, after ka1qux 08fd102). Not for
             // a bake, which keeps what it samples: refused as before.
+            // Nor, past the card's ceiling, without a hole in the blocks of
+            // textures there are: a copy that fits one takes none of the
+            // card's memory and is made, whole or short, and no block is
+            // made for anything this slot makes (`pool::NoNewBlock`: what
+            // fits no hole after all gets memory of its own, its own size).
             let mut short = false;
+            let mut _no_new_block = None;
             if !room {
                 let has_its_texture = reupload_when_full()
                     && heap.handle(index).is_some_and(|handle| host.texture_slot_made_from(index, handle));
-                short = !has_its_texture
-                    && !baking
-                    && sync.is_none()
-                    && *short_room.get_or_insert_with(|| {
-                        crate::resource::room_for_short(crate::host::host().and_then(|h| h.video_memory()))
-                    });
-                if short {
+                let new = !has_its_texture && !baking && sync.is_none();
+                let [whole_in_blocks, short_in_blocks, past] = *holes.get_or_insert_with(|| {
+                    crate::resource::holes_state(crate::host::host().and_then(|h| h.video_memory()))
+                });
+                let mut fits = |short: bool| {
+                    heap.handle(index)
+                        .and_then(crate::descriptor::view)
+                        .and_then(|view| crate::resource::hole_for(&view, short))
+                        .is_some_and(|bytes| *hole.get_or_insert_with(crate::pool::largest_hole) >= bytes)
+                };
+                let in_hole = new && whole_in_blocks && fits(false);
+                if !in_hole {
+                    short = new
+                        && (*short_room.get_or_insert_with(|| {
+                            crate::resource::room_for_short(crate::host::host().and_then(|h| h.video_memory()))
+                        }) || (short_in_blocks && fits(true)));
+                }
+                if past && (in_hole || short || has_its_texture) {
+                    _no_new_block = Some(crate::pool::NoNewBlock::begin());
+                    hole = None;
+                }
+                if in_hole {
+                    HEAP_TEXTURES_IN_HOLES.fetch_add(1, Ordering::Relaxed);
+                } else if short {
                     HEAP_TEXTURES_SHORT.fetch_add(1, Ordering::Relaxed);
                 } else if !has_its_texture {
                     refused += 1;
@@ -3131,6 +3164,11 @@ impl State {
                     // (Short copies take the card's memory too.)
                     short_room = Some(crate::resource::room_for_short(memory));
                 }
+                holes = None;
+            } else if since_asked >= 32 << 20 && holes.is_some() {
+                // (And the copies cut from holes fill the blocks.)
+                since_asked = 0;
+                holes = None;
             }
             HEAP_TEXTURE_BYTES.fetch_add(bytes, Ordering::Relaxed);
             HEAP_TEXTURES.fetch_add(1, Ordering::Relaxed);
