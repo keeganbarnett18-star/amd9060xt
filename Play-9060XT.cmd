@@ -19,6 +19,13 @@ rem 2.7 ms against 13.8). Play-VIctory.cmd keeps it off for colour noise on
 rem skin seen elsewhere; none showed here. Set it to 0 if skin looks noisy.
 if not defined VICTORY_TEXTURE_GUARD set "VICTORY_TEXTURE_GUARD=1"
 
+rem Title memory windows read by the card in place instead of copied: needs
+rem the DirectX 12 Agility SDK beside victory.exe (scripts\get-agility.ps1),
+rem whose runtime has ID3D12Device13; without it the windows are copied as
+rem before. 17-minute walk: private memory 29.4 -> 26.4 GB, lowest free RAM
+rem 0.9 -> 2.4 GB, worst frame 390 -> 162 ms, median unchanged (run 47).
+if not defined VICTORY_INPLACE set "VICTORY_INPLACE=1"
+
 rem 1080p out. Measured on this card: 1664x936 took the card from 93 % to 61 %
 rem busy and the frame stayed at about 35 ms (the preparing thread and the
 rem title set it), so a lower size buys nothing here yet.

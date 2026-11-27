@@ -18,6 +18,24 @@ use std::path::PathBuf;
 use anyhow::Result;
 use clap::{Parser, Subcommand, ValueEnum};
 
+/// The DirectX 12 Agility SDK: the D3D12 runtime this program asks for, and
+/// where it lies (a `D3D12` folder beside the program; `scripts/get-agility.ps1`
+/// puts Microsoft's redistributable there). The system's own runtime on this
+/// fork's test PC (10.0.22621) has no `ID3D12Device13`, so title memory
+/// could not be opened in place for the card (`victory_gpu::inplace`); this
+/// one has it, and the debug layer besides. Without the folder the system's
+/// runtime is used, as before.
+#[cfg(windows)]
+#[unsafe(no_mangle)]
+#[used]
+pub static D3D12SDKVersion: u32 = 620;
+
+/// See [`D3D12SDKVersion`]: a path relative to the program, ending in `\`.
+#[cfg(windows)]
+#[unsafe(no_mangle)]
+#[used]
+pub static D3D12SDKPath: &[u8; 9] = b".\\D3D12\\\0";
+
 #[derive(Parser)]
 #[command(
     name = "victory",
