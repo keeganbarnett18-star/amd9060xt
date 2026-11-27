@@ -1741,6 +1741,16 @@ pub(crate) fn room(memory: Option<[u64; 4]>) -> bool {
 /// 238), and the queue was refused from the first world frame on. With
 /// their room kept, the queue stops that much earlier while the world
 /// loads and gets it back as the targets are made.
+///
+/// Once the world's targets stand (their bytes past
+/// [`targets_settle`]'s floor and not grown for its seconds), what is kept
+/// is what they reached plus a margin, no longer the whole 3,072: in session
+/// play50 they stood at 1,888 MB from the tenth minute, so 1,165 MB stayed
+/// kept for targets never made, more than the 150 MB by which [`room`]
+/// turned the queue down from minute 2 to the end (newer textures went
+/// without their finer levels: the picture grew blurrier the longer one
+/// played). A target made after that starts the wait again, with the whole
+/// reserve kept meanwhile.
 #[cfg(windows)]
 pub(crate) fn targets_room_kept() -> u64 {
     use std::sync::atomic::Ordering::Relaxed;
@@ -1753,7 +1763,59 @@ pub(crate) fn targets_room_kept() -> u64 {
     });
     // Every host texture's bytes less those of the copies the title fills.
     let targets = HOST_TEXTURES[1].load(Relaxed).saturating_sub(KINDS[1].load(Relaxed));
-    most.saturating_sub(targets)
+    most.min(settled_targets_line(targets, crate::host::now_ms()))
+        .saturating_sub(targets)
+}
+
+/// When the world's targets count as standing (`VICTORY_TARGETS_SETTLE_S`,
+/// 60; 0: never, the whole reserve is kept as before), the bytes below
+/// which they do not (`VICTORY_TARGETS_SETTLE_MIN_MB`, 1,536: the loading
+/// screens' 652 MB stand for minutes before the world's 2,255 come at
+/// once), and the margin kept above what they reached
+/// (`VICTORY_TARGETS_MARGIN_MB`, 384).
+#[cfg(windows)]
+fn targets_settle() -> (u64, u64, u64) {
+    static SETTLE: std::sync::OnceLock<(u64, u64, u64)> = std::sync::OnceLock::new();
+    *SETTLE.get_or_init(|| {
+        let read = |name: &str, default: u64| {
+            std::env::var(name).ok().and_then(|v| v.trim().parse::<u64>().ok()).unwrap_or(default)
+        };
+        (
+            read("VICTORY_TARGETS_SETTLE_S", 60) * 1000,
+            read("VICTORY_TARGETS_SETTLE_MIN_MB", 1536) << 20,
+            read("VICTORY_TARGETS_MARGIN_MB", 384) << 20,
+        )
+    })
+}
+
+/// The line [`targets_room_kept`] keeps room up to, by the targets' bytes
+/// now and the time in milliseconds: their highest bytes so far plus the
+/// margin once that highest has stood long enough, else no line.
+#[cfg(windows)]
+fn settled_targets_line(targets: u64, now_ms: u64) -> u64 {
+    use std::sync::atomic::{AtomicU64, Ordering::Relaxed};
+    // The highest bytes seen, and the time (from 1) they last grew.
+    static PEAK: AtomicU64 = AtomicU64::new(0);
+    static GREW: AtomicU64 = AtomicU64::new(0);
+    let (settle_ms, floor, margin) = targets_settle();
+    let now = now_ms.max(1);
+    let before = PEAK.fetch_max(targets, Relaxed);
+    if targets > before || GREW.load(Relaxed) == 0 {
+        GREW.store(now, Relaxed);
+    }
+    let peak = before.max(targets);
+    targets_line(peak, now.saturating_sub(GREW.load(Relaxed)), settle_ms, floor, margin)
+}
+
+/// [`settled_targets_line`]'s rule alone: `peak` plus `margin` once `peak`
+/// is at least `floor` and has stood `stood_ms` of `settle_ms` (not 0).
+#[cfg(any(windows, test))]
+fn targets_line(peak: u64, stood_ms: u64, settle_ms: u64, floor: u64, margin: u64) -> u64 {
+    if settle_ms != 0 && peak >= floor && stood_ms >= settle_ms {
+        peak + margin
+    } else {
+        u64::MAX
+    }
 }
 
 /// [`room`] as it was at most a tenth of a second ago, for a question
@@ -4692,6 +4754,22 @@ float4 lit() : SV_Target { return 1.0; }
         assert_eq!(texture_floor_bytes(Some(12 * GIB)), 2 * GIB);
         assert_eq!(texture_floor_bytes(Some(24 * GIB)), 2 * GIB);
         assert_eq!(texture_floor_bytes(Some(32 * GIB)), 2 * GIB);
+    }
+
+    /// The targets' reserve shrinks to what they reached plus the margin
+    /// only once that is past the floor and has stood long enough.
+    #[test]
+    fn targets_room_follows_targets_that_stand() {
+        const MB: u64 = 1 << 20;
+        let (settle, floor, margin) = (60_000, 1536 * MB, 384 * MB);
+        // The loading screens' 652 MB: never a line, however long they stand.
+        assert_eq!(targets_line(652 * MB, 600_000, settle, floor, margin), u64::MAX);
+        // The world's targets, grown 10 s ago: not yet.
+        assert_eq!(targets_line(1888 * MB, 10_000, settle, floor, margin), u64::MAX);
+        // Standing a minute: what they reached plus the margin.
+        assert_eq!(targets_line(1888 * MB, 60_000, settle, floor, margin), 2272 * MB);
+        // Switched off.
+        assert_eq!(targets_line(1888 * MB, 600_000, 0, floor, margin), u64::MAX);
     }
 
     /// A placed texture viewed from a later level has a host copy of that

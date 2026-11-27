@@ -149,15 +149,45 @@ pub(crate) fn available_physical_ram() -> Option<u64> {
 /// (By those times everything idle for 2.5 s went from 75 % of the budget
 /// on: 61,000 of them in the first 300 s of session play-1125-0203, at 78 to
 /// 80 %, of which 13,000 were made and uploaded again.)
+///
+/// Before that, from [`vram_early_percent`] (82) on, those idle for 30 s,
+/// enough to come down two points under it: the card is cleared before it
+/// fills (in session play50 it reached 88 % within two minutes and the queue
+/// was turned down from then to the end), and 30 s spares what is only out
+/// of sight for a moment.
 pub(crate) fn vram_keep(budget: u64, used: u64) -> (u64, u64) {
+    vram_keep_from(budget, used, vram_early_percent())
+}
+
+/// From what share of the card's budget, in percent, [`vram_keep`] lets go
+/// of copies idle for 30 s: `VICTORY_TEXTURE_EARLY_PERCENT` (82; 0, or 88
+/// and over: not before 88 %, as before).
+fn vram_early_percent() -> u64 {
+    static PERCENT: OnceLock<u64> = OnceLock::new();
+    *PERCENT.get_or_init(|| {
+        std::env::var("VICTORY_TEXTURE_EARLY_PERCENT")
+            .ok()
+            .and_then(|v| v.trim().parse::<u64>().ok())
+            .unwrap_or(82)
+    })
+}
+
+fn vram_keep_from(budget: u64, used: u64, early: u64) -> (u64, u64) {
     const KEPT_MS: u64 = 600_000;
+    const EARLY_MS: u64 = 30_000;
     const IDLE_MS: u64 = 5_000;
     const SHORT_MS: u64 = 1_500;
     if budget == 0 {
         return (IDLE_MS, u64::MAX);
     }
     let share = |percent: u64| budget / 100 * percent;
-    if used < share(88) {
+    let early = (early > 2 && early < 88).then_some(early);
+    if let Some(early) = early
+        && used >= share(early)
+        && used < share(88)
+    {
+        (EARLY_MS, used - share(early - 2))
+    } else if used < share(88) {
         (KEPT_MS, u64::MAX)
     } else if used < share(95) {
         (IDLE_MS, used - share(85))
@@ -10958,14 +10988,20 @@ mod batch {   // Batch::texture_due lives here; `mod tests` is already taken at 
 
     #[test]
     fn textures_are_kept_while_the_card_has_room() {
-        use super::vram_keep;
+        use super::vram_keep_from;
         let gib = 1 << 30;
-        assert_eq!(vram_keep(100 * gib, 87 * gib).0, 600_000);
+        // Without the early band (0), as before.
+        assert_eq!(vram_keep_from(100 * gib, 87 * gib, 0).0, 600_000);
         // Past it: the longest idle ones, enough to come down to 85 %.
-        let (ms, bytes) = vram_keep(100 * gib, 90 * gib);
+        let (ms, bytes) = vram_keep_from(100 * gib, 90 * gib, 82);
         assert_eq!((ms, bytes), (5_000, 5 * gib));
-        assert_eq!(vram_keep(100 * gib, 120 * gib), (1_500, 35 * gib));
-        assert_eq!(vram_keep(0, 7).0, 5_000);
+        assert_eq!(vram_keep_from(100 * gib, 120 * gib, 82), (1_500, 35 * gib));
+        assert_eq!(vram_keep_from(0, 7, 82).0, 5_000);
+        // The early band: under 82 % all are kept; from it, those idle 30 s,
+        // down to 80 %.
+        assert_eq!(vram_keep_from(100 * gib, 81 * gib, 82).0, 600_000);
+        assert_eq!(vram_keep_from(100 * gib, 84 * gib, 82), (30_000, 4 * gib));
+        assert_eq!(vram_keep_from(100 * gib, 87 * gib, 88).0, 600_000);
     }
 
     #[test]
