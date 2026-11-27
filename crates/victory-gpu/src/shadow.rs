@@ -5146,6 +5146,15 @@ fn tail_of(address: u64, end: u64) -> (u64, u64) {
     (start, cell + len - start)
 }
 
+/// A window in place that begins in `cell` at or below `address` and holds
+/// all of `[address, end)`: the nearest such.
+fn placed_holder(map: &BTreeMap<(u64, u64), Arc<Shadow>>, cell: u64, address: u64, end: u64) -> Option<Arc<Shadow>> {
+    map.range((cell, 0)..=(address, u64::MAX))
+        .rev()
+        .find(|((start, bytes), shadow)| start + bytes >= end && shadow.in_place())
+        .map(|(_, shadow)| shadow.clone())
+}
+
 /// Of `windows` (start, bytes), the one an ask of `[address, end)` that
 /// may take any window takes ([`find_any`]): the longest that holds the
 /// whole range.
@@ -5291,6 +5300,16 @@ fn loose(address: u64, end: u64, unsized_ask: bool, any: bool) -> Option<Arc<Sha
             shadow.unsized_asks.fetch_add(1, Ordering::Relaxed);
         }
     };
+    // The page pool in place, run by run (`VICTORY_POOL_FINE=1`): an ask with
+    // a length takes a window in place in its cell that holds it, first.
+    let fine_pool = !unsized_ask && crate::inplace::pool_fine();
+    if fine_pool {
+        let map = LOOSE.read().unwrap_or_else(|e| e.into_inner());
+        if let Some(shadow) = placed_holder(&map, cell, address, end) {
+            note(&shadow);
+            return Some(shadow);
+        }
+    }
     // The window is there already (nearly always): readers share the lock.
     if !(unsized_ask && tails()) && !(any && fine() && !unsized_ask) {
         let map = LOOSE.read().unwrap_or_else(|e| e.into_inner());
@@ -5300,6 +5319,10 @@ fn loose(address: u64, end: u64, unsized_ask: bool, any: bool) -> Option<Arc<Sha
         }
     }
     let mut map = LOOSE.write().unwrap_or_else(|e| e.into_inner());
+    if fine_pool && let Some(shadow) = placed_holder(&map, cell, address, end) {
+        note(&shadow);
+        return Some(shadow);
+    }
     let (start, len) = if unsized_ask && tails() {
         let there = map.range((cell, 0)..=(address, u64::MAX)).map(|(key, _)| *key);
         longest_tail(there, address, end).unwrap_or_else(|| tail_of(address, end))
@@ -5325,6 +5348,19 @@ fn loose(address: u64, end: u64, unsized_ask: bool, any: bool) -> Option<Arc<Sha
         let shadow = Arc::new(Shadow::placed(placed, start, len, true));
         note(&shadow);
         map.insert((start, len), shadow.clone());
+        return Some(shadow);
+    }
+    // The window's memory is pages from all over the pool, but the ask lies
+    // in one run of a section: that run, cut to the cell, in place, and no
+    // copy of the window. A later ask the run does not hold makes its own.
+    if fine_pool
+        && let Some((at, bytes)) = crate::inplace::fine_run(address, end, cell, cell + WINDOW)
+        && let Some(placed) = crate::inplace::pool_place_for(at, bytes, true)
+    {
+        crate::inplace::fine_placed(bytes);
+        let shadow = Arc::new(Shadow::placed(placed, at, bytes, true));
+        note(&shadow);
+        map.insert((at, bytes), shadow.clone());
         return Some(shadow);
     }
     // One buffer in the card's memory, filled by the CPU through the bus.

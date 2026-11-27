@@ -219,6 +219,46 @@ pub fn pool_in_place() -> bool {
     *ON.get_or_init(|| switch(std::env::var("VICTORY_POOL_IN_PLACE").ok().as_deref()))
 }
 
+/// `VICTORY_POOL_FINE=1` (with [`pool_in_place`]): a window of title memory
+/// whose 4 MiB cell is pages from all over the pool, and so not one run of a
+/// section, is placed run by run instead of copied whole. An ask with a
+/// length that lies in one run gets that run, cut to its cell, in place
+/// ([`fine_run`]). Only an ask that spans pages from different places still
+/// makes a copy of the window.
+///
+/// In session play59, 1,554 windows were turned down as scattered and kept
+/// copies (2.4 GB), against 76 placed (332 MB).
+///
+/// shortcut: an ask that spans runs makes a copy of the whole window, beside
+/// the runs in place in the same cell. A write the card makes through one
+/// is not seen through the other until the flight lands.
+pub(crate) fn pool_fine() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    pool_in_place() && *ON.get_or_init(|| switch(std::env::var("VICTORY_POOL_FINE").ok().as_deref()))
+}
+
+/// Of `[address, end)`, if it is one run of a section: the whole run around
+/// it, cut to `[lo, hi)`.
+pub(crate) fn fine_run(address: u64, end: u64, lo: u64, hi: u64) -> Option<(u64, u64)> {
+    fine_run_in(&views().views, address, end, lo, hi)
+}
+
+fn fine_run_in(views: &BTreeMap<usize, (usize, usize, u64)>, address: u64, end: u64, lo: u64, hi: u64) -> Option<(u64, u64)> {
+    let (start, bytes, ..) = stretch_in(views, address as usize, end.saturating_sub(address).max(1) as usize)?;
+    let from = (start as u64).max(lo);
+    let to = ((start + bytes) as u64).min(hi);
+    (from <= address && to >= end && to > from).then_some((from, to - from))
+}
+
+/// Since the start: runs placed by [`pool_fine`], and their bytes.
+static FINE: [AtomicU64; 2] = [const { AtomicU64::new(0) }; 2];
+
+/// A run of [`pool_fine`] placed (also counted with the pool's).
+pub(crate) fn fine_placed(bytes: u64) {
+    FINE[0].fetch_add(1, Ordering::Relaxed);
+    FINE[1].fetch_add(bytes, Ordering::Relaxed);
+}
+
 /// The switch's value as [`pool_in_place`] reads it: `1` only.
 fn switch(value: Option<&str>) -> bool {
     value.is_some_and(|v| v.trim() == "1")
@@ -403,6 +443,13 @@ fn say() {
             p[4],
             p[5]
         );
+        if pool_fine() {
+            tracing::info!(
+                "title memory in place, page pool run by run (VICTORY_POOL_FINE=1, counted in the lines above): since the start {} runs of scattered windows placed ({} MB)",
+                FINE[0].load(Ordering::Relaxed),
+                FINE[1].load(Ordering::Relaxed) >> 20
+            );
+        }
     }
 }
 
@@ -1581,6 +1628,28 @@ pub(crate) mod tests {
         assert_eq!(stretch_in(&views, at + 5 * K64, 2 * K64), None, "into the other section");
         assert_eq!(stretch_in(&views, at + 6 * K64, K64), Some((at + 6 * K64, K64, 8, 16 * K64 as u64)));
         assert_eq!(stretch_in(&views, at + 7 * K64, K64), None, "the gap");
+    }
+
+    /// Run by run (`VICTORY_POOL_FINE`): an ask in one run gets the run cut
+    /// to its cell; an ask over pages from two places, or a gap, gets none.
+    #[test]
+    fn a_fine_run_is_the_asks_run_cut_to_its_cell() {
+        let mut views = BTreeMap::new();
+        let cell = 0x7_2000_0000usize;
+        // The cell's pages: 0..3 one run, 3 from elsewhere, 4..7 one run
+        // that goes on past the cell's end at 6, then a gap.
+        views.insert(cell, (3 * K64, 9, 10 * K64 as u64));
+        views.insert(cell + 3 * K64, (K64, 9, 50 * K64 as u64));
+        views.insert(cell + 4 * K64, (3 * K64, 9, 60 * K64 as u64));
+        let (lo, hi) = (cell as u64, (cell + 6 * K64) as u64);
+        let k = K64 as u64;
+        assert_eq!(fine_run_in(&views, lo + 100, lo + 200, lo, hi), Some((lo, 3 * k)));
+        assert_eq!(fine_run_in(&views, lo + 2 * k, lo + 3 * k, lo, hi), Some((lo, 3 * k)));
+        assert_eq!(fine_run_in(&views, lo + 3 * k + 8, lo + 3 * k + 16, lo, hi), Some((lo + 3 * k, k)));
+        assert_eq!(fine_run_in(&views, lo + 4 * k, lo + 5 * k, lo, hi), Some((lo + 4 * k, 2 * k)), "cut to the cell");
+        assert_eq!(fine_run_in(&views, lo + 2 * k, lo + 4 * k, lo, hi), None, "over two places");
+        assert_eq!(fine_run_in(&views, lo + 5 * k, lo + 7 * k, lo, hi), None, "past the cell");
+        assert_eq!(fine_run_in(&views, lo + 8 * k, lo + 9 * k, lo, hi), None, "no view");
     }
 
     /// What the runtime forgets when memory is mapped anew.
