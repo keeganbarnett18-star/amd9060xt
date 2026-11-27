@@ -35,7 +35,7 @@ Last updated 2026-11-27, after session play56. The sections further down are old
 - The test as it was planned, for reference: `F:\gta6xbox\trace-crash.cmd` set `VICTORY_TEXTURE_NO_WAIT=0` (it was 1). Purpose: driving is close to unplayable while the world streams; in play57 the heavy-streaming moments had 68 textures a frame read through the kernel and 88 ms of frame prep, against 3–7 and 33–40 ms in normal play. Expectation: probably worse. `texture.rs` `no_wait` documents that waiting for the runtime's remap lock gave 0.3–3.7 s frames in runs 99–101. Either result says whether the runtime's remapping during streaming is the bottleneck. **Put it back to 1 after the test.**
 
 - **play59 / play60: step 2, page pool in place (commit 30314070).**
-  - Both sessions ran the same build, with similar driving after a fresh restart. The only difference: play59 had `VICTORY_POOL_IN_PLACE=1`, play60 had it off. Logs: `trace-log-play59.txt` and `trace-log.txt` → play60; `mem-play59.csv` and `mem-play60.csv`. Figures below are in-world samples, play59 vs play60:
+  - Both sessions ran the same build, with similar driving after a fresh restart. The only difference: play59 had `VICTORY_POOL_IN_PLACE=1`, play60 had it off. Logs: `trace-log-play59.txt` and `trace-log-play60.txt`; `mem-play59.csv` and `mem-play60.csv`. Figures below are in-world samples, play59 vs play60:
 
     | | play59 (pool on) | play60 (pool off) | play57 |
     |---|---|---|---|
