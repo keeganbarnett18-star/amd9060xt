@@ -43,9 +43,11 @@ Played by hand into the open world (sessions play52 to play54, 27 November
   blocks also never stopped (20,100 copies moved in 16 minutes against 2,186
   in play52). Each move goes through the kernel, and the write tracking of the
   console's shared memory went from about 3 ms to 30-47 ms a frame. Blocks
-  are drained under 40 % full again, and a block now holds textures of one
-  size class, so that the room inside blocks (1.7 to 2 GB of the card) can be
-  used; both await a play session.
+  are drained under 40 % full again. In session play56 the card's rules then
+  stopped each other: at 95 % of the budget no new texture is made, the sweep
+  counts the room inside blocks (3.3 GB there) as free and lets nothing go,
+  and nothing new loads or unloads (7 to 17 fps). Making a texture that fits
+  a hole in a block, whatever the card's count says, is the next change.
 - **System memory is tight on 32 GB, and the frame rate follows it.** The
   console has one memory; here a texture lies in the game's memory and again
   on the card. The game holds 29-30 GB in the open world. With 4-5 GB of the
@@ -64,9 +66,9 @@ Played by hand into the open world (sessions play52 to play54, 27 November
   ray programs (about 400 dispatches a frame) and the builder's stages (about
   570) are left out, and a stand-in light takes their place. The ray tracing
   build comes later as an option of its own.
-- **One rare crash** ("device removed: invalid call") while descriptor views are
-  being made, seen twice in long play sessions; its cause is being traced with
-  the D3D12 debug layer.
+- **One crash** ("device removed: invalid call") while descriptor views are
+  being made, seen three times now, the last after two and a half minutes in
+  the open world (play56); its cause is not found yet.
 - The game runs in a window, not fullscreen.
 
 ## Roadmap
@@ -122,10 +124,12 @@ and in `docs/findings.md`.
   sweep that counts what it let go in the last second and lets go of 256 MB at
   most a look, and a fixed headroom for render targets once the world is in.
 - **Less churn when the PC's memory is short**: spare upload chunks are freed
-  only when unused (they were freed and made again 60 to 100 times a second
-  for as long as memory was short), and texture blocks hold one size class
-  each (in a played-out simulation, 2.6 GB of blocks for 2 GB of textures
-  against 3.3 GB mixed).
+  only when unused, and a PC of 32 GB keeps 384 MB of them (they were freed
+  and made again 60 to 400 times a second while the world streamed: 436
+  upload buffers in session play56 against 22,665 in two minutes before).
+  Texture blocks of one size class each are there as an option
+  (`VICTORY_TEXTURE_CLASSES=1`; 2.6 GB of blocks for 2 GB of textures against
+  3.3 GB in a simulation), off until a session shows them stable.
 - **Textures painted through another view of their pages** are read whole and
   looked at again every 30 frames (from Kitty6), within a budget of 8 MB a
   frame.
