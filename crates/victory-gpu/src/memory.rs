@@ -963,7 +963,7 @@ fn push() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *ON.get_or_init(|| match std::env::var_os("VICTORY_BVH_PUSH") {
         Some(v) => v == "1",
-        None => std::env::var_os("VICTORY_BVH_BUILDER").is_some_and(|v| v == "1"),
+        None => victory_shader::bvh_builder_on(),
     })
 }
 
