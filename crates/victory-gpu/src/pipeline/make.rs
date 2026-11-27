@@ -257,6 +257,17 @@ pub(crate) fn now(p: &Arc<Pending>) -> bool {
     p.made.get().is_some_and(|made| made.is_some())
 }
 
+/// Queues `p` for the workers if it is not made or queued yet: `asked`, as
+/// a draw's is (before the pipelines nothing has asked for), or else among
+/// those made early. Does not wait. (From notquiteog/victory-nvidia
+/// 203bbfd4, GPL-3.0-or-later; one left out, as [`now`] and [`early`] do,
+/// is not queued.)
+pub(crate) fn soon(p: &Arc<Pending>, asked: bool) {
+    if p.left_out.is_none() && p.made.get().is_none() && !p.shaders.is_empty() {
+        start(p, if asked { REQUESTED } else { EARLY });
+    }
+}
+
 /// At the title's creation of a pipeline: starts it at once if an earlier
 /// run drew with it (during loading, so the world's first frames find it),
 /// or if it is a confirmed opening-scene / bake producer.
