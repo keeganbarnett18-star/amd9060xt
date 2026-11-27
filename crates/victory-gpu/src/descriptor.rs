@@ -939,12 +939,28 @@ fn constant_of(i: u32, generation: u32) -> View {
 }
 
 /// A placed view's shape and its address.
+///
+/// Padding is left out: titles leave whatever was on their stack there, and
+/// with it nearly every view was a shape of its own (2.1 million after 17
+/// minutes, run 38, growing by 2,000 a second; run 41 found the differing
+/// words): words 1 and 13 of the resource description (between its dimension and
+/// its 8-byte alignment, and after its flags), and of a shader resource view word 3 (between the
+/// component mapping and the 8-byte union) and, for a buffer, word 9 (past
+/// its first element, count, stride and flags).
 fn shape_of(unordered: bool, resource: &[u32; 14], desc: &[u32; 16]) -> (Shape, u64) {
+    let mut resource = *resource;
+    (resource[1], resource[13]) = (0, 0);
     let mut rest = [0u32; 14];
     rest[..10].copy_from_slice(&desc[..10]);
     rest[10..].copy_from_slice(&desc[12..]);
+    if !unordered {
+        rest[3] = 0;
+        if desc[1] == 1 {
+            rest[9] = 0;
+        }
+    }
     (
-        (unordered, *resource, rest),
+        (unordered, resource, rest),
         u64::from(desc[10]) | u64::from(desc[11]) << 32,
     )
 }
@@ -1734,8 +1750,9 @@ mod tests {
         let slots = [0u64; 4];
         let at = slots.as_ptr() as u64;
         // A resource description and a view no other test uses.
-        let resource: [u32; 14] = std::array::from_fn(|k| 0x5ee0_0000 + k as u32);
-        let mut desc: [u32; 16] = std::array::from_fn(|k| 0x7a70_0000 + k as u32);
+        // (Padding zero: a shape leaves it out, [`shape_of`].)
+        let resource: [u32; 14] = std::array::from_fn(|k| if k == 1 || k == 13 { 0 } else { 0x5ee0_0000 + k as u32 });
+        let mut desc: [u32; 16] = std::array::from_fn(|k| if k == 3 { 0 } else { 0x7a70_0000 + k as u32 });
         let mine = |v: &View| match v {
             View::Constant(address, _) => (0x6_0000_0000..0x6_1000_0000).contains(address),
             View::Placed(_, r, _) => *r == resource,
@@ -1754,6 +1771,12 @@ mod tests {
         }
         assert_eq!(entries(), 0, "no table entries");
         assert_eq!(shapes(), 1, "one shape for 20,000 placed views");
+        // What a title left in the padding makes no other shape.
+        let (mut dirty_resource, mut dirty) = (resource, desc);
+        (dirty_resource[1], dirty_resource[13], dirty[3]) = (0x1234_5678, 0x7ffc, 0x3e4e_0000);
+        create_placed_srv(null, &dirty_resource, &dirty, at);
+        assert_eq!(view(at), Some(View::Placed(false, resource, desc)));
+        assert_eq!(shapes(), 1, "padding is no part of a shape");
         // The same shape, unordered: another shape.
         create_placed_uav(null, &resource, &desc, at);
         assert_eq!(view(at), Some(View::Placed(true, resource, desc)));
