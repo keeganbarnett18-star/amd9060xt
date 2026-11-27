@@ -278,6 +278,10 @@ unsafe impl Send for PoolHeap {}
 /// before the runtime closes the handle: never opened after.
 static POOL_HEAPS: std::sync::Mutex<Vec<PoolHeap>> = std::sync::Mutex::new(Vec::new());
 
+/// Sections a pool heap was opened on, by our view of them ([`pool_heap`]):
+/// their view is never unmapped.
+static ON_VIEW: std::sync::Mutex<Vec<usize>> = std::sync::Mutex::new(Vec::new());
+
 /// Since the start: title buffers and windows placed in the page pool and
 /// their bytes; sections opened and their bytes; turned down because the
 /// memory is not one run of a committed section; refused by the host.
@@ -359,10 +363,33 @@ fn pool_heap(device: &ID3D12Device, section: usize) -> Result<ID3D12Heap, Option
     }
     // Still the runtime's (its handle open): `title_memory_section_gone`
     // takes it off under the lock held here.
-    let Some(&(_, bytes, true)) = views().sections.iter().find(|s| s.0 == section) else {
-        return Err(None);
+    //
+    // Opened on our own view of the whole section, by its address, not on
+    // the section's handle. A heap opened with
+    // `OpenExistingHeapFromFileMapping` keeps the section's commit after the
+    // process has ended, even with every heap and handle let go first (the
+    // driver of an RX 9060 XT, 2026-11-27: some 28 GB of the PC's commit
+    // owned by no process after four sessions, the written pages stuck in
+    // RAM as compressed memory until a restart; `pool_section_leak_probe`:
+    // +1.00 GB a run by handle, +0.00 by address). Both ways keep all of the
+    // section in RAM while the heap is open.
+    let base = {
+        let mut v = views_mut();
+        let Some(&(_, bytes, true)) = v.sections.iter().find(|s| s.0 == section) else {
+            return Err(None);
+        };
+        match whole_view(&mut v, section) {
+            Some(base) if base != 0 => {
+                // The view stays while a heap may stand on it
+                // (`title_memory_section_gone`).
+                ON_VIEW.lock().unwrap_or_else(|e| e.into_inner()).push(section);
+                (base, bytes)
+            }
+            _ => return Err(None),
+        }
     };
-    let opened = open(device, From::Section(section));
+    let (base, bytes) = base;
+    let opened = open(device, From::Region(base));
     heaps.push(PoolHeap { section, heap: opened.as_ref().ok().cloned() });
     let heap = opened.map_err(Some)?;
     POOL[2].fetch_add(1, Ordering::Relaxed);
@@ -546,6 +573,8 @@ pub fn title_memory_section(section: usize, bytes: u64, committed: bool) {
     // A handle's number given out again: a heap opened on it was of the
     // section that had it before.
     POOL_HEAPS.lock().unwrap_or_else(|e| e.into_inner()).retain(|h| h.section != section);
+    // (A view a heap stood on stays mapped, forgotten below.)
+    ON_VIEW.lock().unwrap_or_else(|e| e.into_inner()).retain(|&s| s != section);
     let mut v = views_mut();
     v.sections.retain(|s| s.0 != section);
     // A handle's number given out again: the view was of the section that
@@ -566,6 +595,14 @@ pub fn title_memory_section_gone(section: usize) {
         if pool_in_place() {
             views_mut().sections.retain(|s| s.0 != section);
         }
+    }
+    // A pool heap was opened on our view of it ([`pool_heap`]): buffers
+    // placed in it may still be bound, so the view stays mapped (and the
+    // section with it) until the process ends. The runtime lets go of a
+    // pool section seldom, if ever.
+    if ON_VIEW.lock().unwrap_or_else(|e| e.into_inner()).contains(&section) {
+        views_mut().whole.retain(|w| w.0 != section);
+        return;
     }
     let whole = {
         let mut v = views_mut();
@@ -837,21 +874,25 @@ pub(crate) fn beside(at: usize, len: usize) -> Option<usize> {
     let Cover::Run(section, offset) = cover_in(&v.views, at, len) else {
         return None;
     };
-    let base = match v.whole.iter().find(|w| w.0 == section) {
-        Some(w) => w.1,
-        None => {
-            let &(_, bytes, _) = v.sections.iter().find(|s| s.0 == section)?;
-            // SAFETY: the whole of a section the runtime made; a view the
-            // title sees is of it, so its handle is open.
-            let base = unsafe { mem::MapViewOfFile(section as _, mem::FILE_MAP_WRITE, 0, 0, bytes as usize) }.Value as usize;
-            if base == 0 {
-                tracing::warn!(error = %std::io::Error::last_os_error(), "no view of the title's pages beside its own");
-            }
-            v.whole.push((section, base));
-            base
-        }
-    };
+    let base = whole_view(&mut v, section)?;
     (base != 0).then(|| base + offset as usize)
+}
+
+/// Our own view of the whole of `section` (0: the host gave none), made at
+/// the first ask and kept; `None` if the runtime made no such section.
+fn whole_view(v: &mut Views, section: usize) -> Option<usize> {
+    if let Some(w) = v.whole.iter().find(|w| w.0 == section) {
+        return Some(w.1);
+    }
+    let &(_, bytes, _) = v.sections.iter().find(|s| s.0 == section)?;
+    // SAFETY: the whole of a section the runtime made; it is still the
+    // runtime's (its handle open), as the caller found it in `sections`.
+    let base = unsafe { mem::MapViewOfFile(section as _, mem::FILE_MAP_WRITE, 0, 0, bytes as usize) }.Value as usize;
+    if base == 0 {
+        tracing::warn!(error = %std::io::Error::last_os_error(), "no view of the title's pages beside its own");
+    }
+    v.whole.push((section, base));
+    Some(base)
 }
 
 /// Our own address of the 64 KiB page the title sees at `page` ([`beside`]),
@@ -1557,6 +1598,90 @@ pub(crate) fn tick() {
 #[cfg(test)]
 pub(crate) mod tests {
     use super::*;
+
+    /// The page pool's memory after the process ends (2026-11-27: some 28 GB
+    /// of commit owned by no process after four sessions with
+    /// `VICTORY_POOL_IN_PLACE=1`). A committed section of 1 GiB, written
+    /// whole, opened as a heap on the card with a buffer in it, as
+    /// [`pool_place`] does; then the process ends. `LEAK_MODE`: `none`, no
+    /// heap; `keep`, the heap still open at the end (as the game ends);
+    /// `release`, everything let go in order first. Run alone, on the card,
+    /// and compare the PC's commit before and after the process:
+    /// `cargo test -p victory-gpu --lib pool_section_leak_probe -- --ignored`.
+    #[test]
+    #[ignore = "a probe on the card; read the PC's commit around it"]
+    fn pool_section_leak_probe() {
+        use windows::Win32::Graphics::Direct3D::D3D_FEATURE_LEVEL_12_0;
+        use windows::Win32::Graphics::Dxgi::*;
+        use windows_sys::Win32::System::Memory as mem;
+        const SIZE: usize = 1 << 30;
+        let mode = std::env::var("LEAK_MODE").unwrap_or_else(|_| "keep".to_owned());
+        // SAFETY: plain device creation, and a section and view of our own.
+        unsafe {
+            let factory: IDXGIFactory4 = CreateDXGIFactory2(DXGI_CREATE_FACTORY_FLAGS(0)).unwrap();
+            let adapter = (0..)
+                .map_while(|i| factory.EnumAdapters1(i).ok())
+                .find(|a| a.GetDesc1().is_ok_and(|d| d.Flags & DXGI_ADAPTER_FLAG_SOFTWARE.0 as u32 == 0))
+                .expect("a card");
+            let mut device: Option<ID3D12Device> = None;
+            D3D12CreateDevice(&adapter, D3D_FEATURE_LEVEL_12_0, &mut device).unwrap();
+            let device = device.unwrap();
+            let invalid = windows_sys::Win32::Foundation::INVALID_HANDLE_VALUE;
+            let handle = mem::CreateFileMappingW(
+                invalid,
+                std::ptr::null(),
+                mem::PAGE_READWRITE | mem::SEC_COMMIT,
+                (SIZE >> 32) as u32,
+                SIZE as u32,
+                std::ptr::null(),
+            );
+            assert!(!handle.is_null());
+            let view = mem::MapViewOfFile(handle, mem::FILE_MAP_ALL_ACCESS, 0, 0, SIZE);
+            assert!(!view.Value.is_null());
+            // `LEAK_TOUCH=0`: only the first 1 MiB written, as a pool the
+            // title has not filled.
+            let touched = if std::env::var("LEAK_TOUCH").is_ok_and(|v| v == "0") { 1 << 20 } else { SIZE };
+            std::ptr::write_bytes(view.Value.cast::<u8>(), 0x5a, touched);
+            let avail = || {
+                let mut s = windows_sys::Win32::System::SystemInformation::MEMORYSTATUSEX {
+                    dwLength: size_of::<windows_sys::Win32::System::SystemInformation::MEMORYSTATUSEX>() as u32,
+                    ..std::mem::zeroed()
+                };
+                windows_sys::Win32::System::SystemInformation::GlobalMemoryStatusEx(&mut s);
+                s.ullAvailPhys as f64 / (1u64 << 30) as f64
+            };
+            let before = avail();
+            let heap = match mode.as_str() {
+                "none" => None,
+                // Opened on the view's address instead of the section's handle.
+                "address" => Some(
+                    device
+                        .cast::<ID3D12Device3>()
+                        .unwrap()
+                        .OpenExistingHeapFromAddress::<ID3D12Heap>(view.Value)
+                        .unwrap(),
+                ),
+                _ => Some(open(&device, From::Section(handle as usize)).unwrap()),
+            };
+            let placed = heap.as_ref().map(|h| place(&device, h, 0, 1 << 20).unwrap());
+            std::thread::sleep(std::time::Duration::from_secs(2));
+            eprintln!(
+                "pool_section_leak_probe: mode {mode}, {} MiB of 1 GiB written, heap {}, RAM available {before:.2} -> {:.2} GB with the heap open",
+                touched >> 20,
+                heap.is_some(),
+                avail()
+            );
+            if mode == "release" {
+                drop(placed);
+                drop(heap);
+                mem::UnmapViewOfFile(view);
+                windows_sys::Win32::Foundation::CloseHandle(handle);
+                drop(device);
+            } else {
+                std::mem::forget((placed, heap, device));
+            }
+        }
+    }
 
     /// Views as the runtime tells them: a range inside one view, or over
     /// views that continue each other in one section, is one run; over
