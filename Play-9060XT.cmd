@@ -33,6 +33,14 @@ rem The title's modes: 1280x720 1664x936 1920x1080 2560x1440 3840x2160.
 if not defined VICTORY_OUTPUT set "VICTORY_OUTPUT=1920x1080"
 rem Lower still if the card is the limit: VICTORY_RENDER_SCALE=0.667 (0.5-1.0).
 
+rem The light the title traces rays for (rays find nothing here): the estimate
+rem from the frame, which follows the hour, the room and its lamps and bounds
+rem the haze (VICTORY_AMBIENT_AIR), no brighter than Play-VIctory.cmd's
+rem constant 0.8 so that a bright doorway does not wash the room out.
+rem VICTORY_AMBIENT=constant:0.8 for the even light of before.
+if not defined VICTORY_AMBIENT set "VICTORY_AMBIENT=1"
+if not defined VICTORY_AMBIENT_MOST set "VICTORY_AMBIENT_MOST=0.8"
+
 rem 32 GB of RAM: runs on the 7900 XTX PC used 40-46 GB private, so Windows
 rem leans on the page file. Keep a system-managed page file on a fast drive.
 

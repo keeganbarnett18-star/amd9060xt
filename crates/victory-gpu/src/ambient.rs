@@ -29,6 +29,8 @@
 //! - `constant:<level>`: the constant, as beloooo's fork has it.
 //!
 //! `VICTORY_AMBIENT_SHADE=<strength>,<radius in metres>` sets the creases.
+//! `VICTORY_AMBIENT_MOST=<level>` is the estimate's ceiling, in the
+//! constant's units.
 //!
 //! The air of a room is lit by the same probes: without rays they hold the
 //! sky's light indoors too, a brown veil at sunset. `VICTORY_AMBIENT_AIR`
@@ -112,6 +114,21 @@ fn air() -> f32 {
     })
 }
 
+/// The brightest the estimate makes the light, in the constant's units
+/// (`VICTORY_AMBIENT_MOST=<level>`; unset or 0: no ceiling). With the
+/// estimate (`VICTORY_AMBIENT=1`) and a ceiling of the constant's 0.8, the
+/// light follows the hour, the room and its lamps below that level and the
+/// air is bounded by it (`VICTORY_AMBIENT_AIR`, which the constant leaves
+/// alone), while a bright doorway filling the view no longer washes the room
+/// out (why the launchers took the constant, 22d4a742).
+fn ceiling() -> f32 {
+    static SET: OnceLock<f32> = OnceLock::new();
+    *SET.get_or_init(|| {
+        let set = std::env::var("VICTORY_AMBIENT_MOST").unwrap_or_default();
+        set.trim().parse().ok().filter(|v: &f32| v.is_finite() && *v > 0.0).unwrap_or(0.0)
+    })
+}
+
 /// Strength and radius of the creases' shade.
 fn shade() -> [f32; 2] {
     static SET: OnceLock<[f32; 2]> = OnceLock::new();
@@ -137,7 +154,7 @@ const SOURCE: &str = r#"
 cbuffer Set : register(b0) {
     float level; float constant; float strength; float radius;
     float near; float tan_y; uint width; uint height;
-    float follow; float most; float air; float unused;
+    float follow; float most; float air; float ceiling;
 };
 Texture2D<float> depth : register(t0);
 // Cells: the light they send out (then, at CELLS, the slow mean), from
@@ -322,6 +339,10 @@ void raise(uint3 at : SV_DispatchThreadID) {
     found = all + 1.2 * float3(dot(sr.xyz, n), dot(sg.xyz, n), dot(sb.xyz, n)) / sum;
     found = clamp(found, 0.2 * all, 2.5 * all);
     found = lerp(found, cells[CELLS].rgb, 0.2) * level * open;
+    // No brighter than the ceiling (`VICTORY_AMBIENT_MOST`): a bright
+    // doorway filling the view raises the cells, not the room past it.
+    float lum = dot(found, LUMA);
+    if (ceiling > 0.0 && lum > ceiling * open) found *= ceiling * open / lum;
     float3 was = unpack(light[p]);
     // What the program left counts as far as it can be true: the sky's light
     // outdoors, not the blocks of other memory.
@@ -475,6 +496,7 @@ pub(crate) fn after(list: &HostList, role: Role, views: &Views) -> bool {
     words[8] = 0.04f32.to_bits();
     words[9] = 4.0f32.to_bits();
     words[10] = air().to_bits();
+    words[11] = ceiling().to_bits();
     let l = &list.list;
     // SAFETY: an open list with the heap of the views set; the title's
     // program has just used both views, so their textures are in the states
