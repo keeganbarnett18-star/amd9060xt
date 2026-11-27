@@ -46,6 +46,21 @@ pub(super) fn on() -> bool {
 /// The most bytes copied out of memory shaders do not write.
 const MOST: usize = 8 << 20;
 
+/// Whether a title copy out of memory our shaders write, into memory that
+/// has no host copy, is read back on the card too
+/// ([`HostList::read_back_copy`]; `VICTORY_CARD_TITLE_COPIES=1`, off by
+/// default).
+fn card_title_copies() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_CARD_TITLE_COPIES").is_some_and(|v| v == "1"))
+}
+
+/// The most bytes such a copy reads back: the sizes are 8 bytes a slot.
+const BACK_MOST: usize = 64 << 10;
+
+/// Copies read back so ([`HostList::read_back_copy`]), since the start.
+static READ_BACK: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
 /// Since the last frame-rate line: copies at their place, their bytes, those
 /// out of a host copy, and texture copies out of one.
 pub(super) static STATS: [std::sync::atomic::AtomicU64; 4] = [const { std::sync::atomic::AtomicU64::new(0) }; 4];
@@ -265,6 +280,67 @@ impl HostList {
         }));
         deferred.title_written();
         self.changed_something();
+        true
+    }
+
+    /// A copy that [`HostList::place_copy`] left to submission, of bytes
+    /// shaders of ours write into memory that has no host copy (a buffer the
+    /// title reads on the CPU): also made on the card at this place of the
+    /// list, into a read-back buffer that goes to title memory once the list
+    /// has run (`read_backs`). `false` if it is not such a copy; the caller
+    /// copies at submission in any case.
+    ///
+    /// The title copies each new structure's compacted size out of the
+    /// builder's buffer this way and reads it on the CPU a frame or two later.
+    /// Done at submission only, on the CPU, before the list's shaders ran, the
+    /// copy took what the slot held before them: the previous structure's
+    /// size, or zeros, or our bound (`crate::bvhsize`), and the compacting
+    /// copy that followed wrote over the neighbours (upstream issue #2781).
+    /// After fxceless/victory-fork PR #994 fd26fb66 (GPL-3.0-or-later), where
+    /// such copies run on the card between two host copies; here the
+    /// destination has none, so ours reads back. In the builder's first frame
+    /// 337-341 sizes went that way there (rt-trace5, rt-trace7). Only with
+    /// `VICTORY_CARD_TITLE_COPIES=1`: moving every title copy to the card
+    /// cost 205 -> 232 ms a frame there, so only these, of at most 64 KiB.
+    pub(crate) fn read_back_copy(&self, dst: usize, src: usize, len: usize) -> bool {
+        if !card_title_copies() || len == 0 || len > BACK_MOST {
+            return false;
+        }
+        let Some(host) = host() else {
+            return false;
+        };
+        if crate::shadow::peek(dst as u64, len as u64).is_some() {
+            return false;
+        }
+        let Some(from) = shaders_own(src, len) else {
+            return false;
+        };
+        let Some(back) = host.read_back_buffer(len as u64) else {
+            return false;
+        };
+        name(&back, || "a title copy read back".into());
+        from.refresh(self, src as u64, len as u64);
+        // SAFETY: an open list; live buffers (the list keeps both), ranges
+        // inside them; the read-back buffer is made in the copy's state.
+        unsafe {
+            wait_for_all(host, &self.list);
+            self.list.CopyBufferRegion(&back, 0, &from.buffer, from.offset(src as u64), len as u64);
+            wait_for_all(host, &self.list);
+        }
+        self.keep(&from.buffer);
+        self.keep(&back);
+        self.defer_read_back(back, dst as *mut u8, [len, 1, len]);
+        let n = READ_BACK.fetch_add(1, Ordering::Relaxed);
+        if n < 4 || n.is_power_of_two() {
+            tracing::info!(
+                n = n + 1,
+                dst = format_args!("{dst:#x}"),
+                src = format_args!("{src:#x}"),
+                len,
+                "a title copy out of memory shaders write, into memory without a host copy: read back on the card too \
+                 (VICTORY_CARD_TITLE_COPIES)"
+            );
+        }
         true
     }
 

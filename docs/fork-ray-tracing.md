@@ -97,6 +97,7 @@ after it was given them as an unordered access view.
 | `VICTORY_BVH_SIZES_WAIT=1` | submissions that ask for structures' sizes are waited for (off: no help, slow) |
 | `VICTORY_BVH_BUILDER_EARLY=0` | the builder's pipelines are made one after another at its first dispatch, as before (Known gaps) |
 | `VICTORY_BVH_SIZES_BOUND=0` | a structure's compacted size is not given a bound before the card's lands (on with the builder; Known gaps) |
+| `VICTORY_CARD_TITLE_COPIES=1` | a title copy out of memory our shaders write into memory without a host copy (the compacted sizes the title reads on the CPU) is also read back on the card after the shaders, and lands in title memory once the list has run (after fxceless PR #994 fd26fb66; upstream issue #2781) |
 | `VICTORY_BVH_BOUNDS=0` | the builder's accesses are not bounded |
 | `VICTORY_BVH_TRACE=1` | logs what sizes are asked, when they came, and the copies (diagnostics) |
 | `VICTORY_BVH_QUARANTINE=1` | nothing it stores comes back to title memory |

@@ -922,6 +922,12 @@ fn buffer_copy(this: This, list: &crate::host::HostList, to: *mut u8, from: *con
     if list.place_copy(to as usize, from as usize, len) {
         with_state(this, |_, state| state.copied());
     } else {
+        // Out of memory our shaders write into memory without a host copy
+        // (the structures' sizes the title reads on the CPU): read back on
+        // the card as well, after the shaders (`VICTORY_CARD_TITLE_COPIES=1`).
+        // At submission, as before, too: until the list has run, title
+        // memory has what it had (and the size's bound, `crate::bvhsize`).
+        let _ = list.read_back_copy(to as usize, from as usize, len);
         list.defer_copy(to, from, len);
     }
 }
