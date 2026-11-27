@@ -1994,6 +1994,36 @@ pub(crate) fn room_for_short(memory: Option<[u64; 4]>) -> bool {
     under_short_line(budget, used, counted, percent, short_hard_percent())
 }
 
+/// Whether copies made short of room ([`ShortOfRoom`]) are made whole
+/// again ([`regrow`]): while the card's memory in use, counted as [`room`]
+/// counts it, is under `VICTORY_REGROW_PERCENT` of its budget (82, where
+/// the sweep's early band begins: `crate::host::vram_keep`; from 50 to
+/// [`room_percent`]), and its use as the system counts it under
+/// [`hard_percent`].
+///
+/// At [`room`]'s own line (90) a copy made whole took the room the next
+/// texture needed, which was then made short, and made whole in its turn:
+/// in session play53, from the open world on (10:13), 2,000 short copies a
+/// minute were made whole, 10,000 copies a minute let go and 4,000 to 5,000
+/// made again, while close objects came back with their coarse levels.
+#[cfg(windows)]
+pub(crate) fn room_to_regrow(memory: Option<[u64; 4]>) -> bool {
+    static PERCENT: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
+    let percent = *PERCENT.get_or_init(|| {
+        std::env::var("VICTORY_REGROW_PERCENT")
+            .ok()
+            .and_then(|v| v.trim().parse::<u64>().ok())
+            .map_or(82, |p| p.clamp(50, room_percent()))
+            .min(room_percent())
+    });
+    let Some([budget, used, ..]) = memory else {
+        return false;
+    };
+    let counted =
+        used.saturating_sub(crate::pool::texture_room()) + crate::shadow::card_room_kept() + targets_room_kept();
+    under_short_line(budget, used, counted, percent, hard_percent())
+}
+
 /// The share of the card's budget, as the system counts its use, up to
 /// which copies made short of room ([`ShortOfRoom`]) are still made:
 /// `VICTORY_SHORT_HARD_PERCENT` (98; from [`hard_percent`] to 100).

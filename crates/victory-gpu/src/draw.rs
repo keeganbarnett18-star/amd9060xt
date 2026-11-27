@@ -2619,8 +2619,14 @@ impl State {
         host.texture_slots_flip();
         // And with room, the textures whose upload left a held level
         // without the card's memory are uploaded again.
+        // Whether copies made short of room are made whole in this pass:
+        // only with room to spare (`resource::room_to_regrow`), not at the
+        // line itself.
+        let regrow_room = room && crate::resource::room_to_regrow(memory);
         if room {
             host.texture_slots_waiting(frame);
+        }
+        if regrow_room {
             // And the slots of textures made short of room, whose copies
             // are made whole below (`resource::regrow`).
             host.texture_slots_regrow(frame);
@@ -2947,7 +2953,7 @@ impl State {
             // A host copy made short of room is replaced by a whole one now
             // that the card has room, made and uploaded here; without room
             // it is looked at again later (not for a bake, as above).
-            crate::resource::regrow(resource, room && !baking && !sync_bake);
+            crate::resource::regrow(resource, room && regrow_room && !baking && !sync_bake);
             let texture = crate::resource::host_resource(resource);
             if crate::residency::upload_refused() {
                 served = false;
