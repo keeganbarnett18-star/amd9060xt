@@ -134,6 +134,10 @@ struct List {
     /// ([`thin`]; then there is no `host`).
     #[cfg(windows)]
     thin: thin::Front,
+    /// Its host list went with a submission and none waits in its place
+    /// ([`take_host`]): its next reset takes one.
+    #[cfg(windows)]
+    parked: bool,
 }
 
 /// One part of a title list cut at its waits: the waits the queue stands
@@ -214,7 +218,7 @@ impl Detached {
 /// A host list that has run and waits to be used again, and the bytes of
 /// upload memory it keeps.
 #[cfg(windows)]
-struct Idle(crate::host::HostList, u64);
+struct Idle(crate::host::HostList, u64, std::time::Instant);
 
 // SAFETY: D3D12 objects are free-threaded, and an idle list is touched by
 // nobody until it is taken out again.
@@ -237,8 +241,15 @@ static IDLE: std::sync::Mutex<(Vec<Idle>, u64)> = std::sync::Mutex::new((Vec::ne
 /// profile cpu-1), and the most upload memory they may keep
 /// between them (a list keeps scratch chunks over a reset only while lists
 /// do not share them, `VICTORY_SCRATCH_POOL=0`).
+/// `VICTORY_LIST_IDLE` sets the count (each idle list keeps its command
+/// allocators, which hold the driver's command memory in the PC's RAM: on
+/// this AMD driver 1 MB at least, more for the long lists it once held).
 #[cfg(windows)]
-const IDLE_MOST: (usize, u64) = (512, 256 << 20);
+fn idle_most() -> (usize, u64) {
+    static MOST: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    let count = *MOST.get_or_init(|| std::env::var("VICTORY_LIST_IDLE").ok().and_then(|v| v.trim().parse().ok()).unwrap_or(512));
+    (count, 256 << 20)
+}
 
 /// Whether host lists that have run are used again (on by default;
 /// `VICTORY_LIST_POOL=0`: each is made new and thrown away, as before).
@@ -248,6 +259,46 @@ fn pools() -> bool {
     *ON.get_or_init(|| std::env::var_os("VICTORY_LIST_POOL").is_none_or(|v| v != "0"))
 }
 
+/// Whether a submitted list is left without a host list until the title
+/// resets it (`VICTORY_LIST_PARK=0`: it gets a new, closed one at once, as
+/// before). Each host list holds command allocators, whose command memory
+/// the driver keeps in the PC's RAM as long as they live, however little
+/// they hold: on the RX 9060 XT 1 MB each from the first list opened on
+/// one, and as much as the longest recording it ever held. With a closed
+/// list waiting in each of the title's 600 and more lists, about as many
+/// allocators sat idle, with their memory, as lists the title has.
+#[cfg(windows)]
+fn park_on() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_LIST_PARK").is_none_or(|v| v != "0"))
+}
+
+/// Takes the host side of a submitted list: parked ([`park_on`]) or with a
+/// new, closed host list in its place for its next reset. `None` leaves
+/// the list as it was.
+#[cfg(windows)]
+fn take_host(list: &mut List) -> Option<crate::host::HostList> {
+    if park_on() {
+        let host = list.host.take()?;
+        list.parked = true;
+        return Some(host);
+    }
+    let fresh = fresh_list()?;
+    // A new host list is open; the title's next call on its list is a
+    // reset, which wants it closed.
+    fresh.close();
+    list.host.replace(fresh)
+}
+
+/// How long a host list may sit idle before it is let go
+/// (`VICTORY_LIST_IDLE_S`, 5 s; 0: kept until the pool is full, as before).
+#[cfg(windows)]
+fn idle_seconds() -> Option<u64> {
+    static MOST: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
+    let most = *MOST.get_or_init(|| std::env::var("VICTORY_LIST_IDLE_S").ok().and_then(|v| v.trim().parse().ok()).unwrap_or(5));
+    (most > 0).then_some(most)
+}
+
 /// A host list open for recording: one that has run, as a title's list is
 /// after its reset, or a new one.
 #[cfg(windows)]
@@ -255,13 +306,13 @@ fn fresh_list() -> Option<crate::host::HostList> {
     let idle = {
         let mut idle = IDLE.lock().unwrap_or_else(|e| e.into_inner());
         let taken = idle.0.pop();
-        if let Some(Idle(_, bytes)) = &taken {
+        if let Some(Idle(_, bytes, _)) = &taken {
             idle.1 -= bytes;
         }
         taken
     };
     match idle {
-        Some(Idle(list, _)) => Some(list),
+        Some(Idle(list, _, _)) => Some(list),
         None => crate::host::host().and_then(|h| h.new_list().ok()),
     }
 }
@@ -279,7 +330,7 @@ pub(crate) fn recycle(lists: Vec<Detached>, ran: &[usize]) {
         // The descriptor slots and the upload memory its commands named.
         drop(_state);
         drop(_uploads);
-        if !ran.contains(&i) || IDLE.lock().unwrap_or_else(|e| e.into_inner()).0.len() >= IDLE_MOST.0 {
+        if !ran.contains(&i) || IDLE.lock().unwrap_or_else(|e| e.into_inner()).0.len() >= idle_most().0 {
             continue;
         }
         // As the title's reset does: what the list kept for its commands
@@ -287,10 +338,22 @@ pub(crate) fn recycle(lists: Vec<Detached>, ran: &[usize]) {
         host.reset();
         let bytes = host.scratch_kept();
         let mut idle = IDLE.lock().unwrap_or_else(|e| e.into_inner());
-        if idle.0.len() < IDLE_MOST.0 && idle.1 + bytes <= IDLE_MOST.1 {
-            idle.0.push(Idle(host, bytes));
+        if idle.0.len() < idle_most().0 && idle.1 + bytes <= idle_most().1 {
+            idle.0.push(Idle(host, bytes, std::time::Instant::now()));
             idle.1 += bytes;
         }
+        // Lists are taken from the top, so those at the bottom are the ones
+        // no submission has needed for longest. Their allocators keep the
+        // command memory of the longest recording they ever held (a pool of
+        // 64 instead of 512 held 1.9 GB less of the PC's RAM, run 36): let them go.
+        let old = idle_seconds().and_then(|most| {
+            idle.0.first().is_some_and(|i| i.2.elapsed().as_secs() >= most).then(|| idle.0.remove(0))
+        });
+        if let Some(Idle(_, bytes, _)) = &old {
+            idle.1 -= bytes;
+        }
+        drop(idle);
+        drop(old);
     }
 }
 
@@ -403,16 +466,10 @@ pub(crate) fn detach_parts(lists: &[This]) -> Parts {
             }
             continue;
         }
-        let Some(fresh) = fresh_list() else {
-            continue;
-        };
-        // A new host list is open; the title's next call on its list is a
-        // reset, which wants it closed.
-        fresh.close();
         // SAFETY: one of our lists, closed and submitted: nothing records
         // into it until the title resets it.
         let list = unsafe { &mut *this.cast_mut().cast::<List>() };
-        let Some(host) = list.host.replace(fresh) else {
+        let Some(host) = take_host(list) else {
             continue;
         };
         let earlier = std::mem::take(&mut list.earlier);
@@ -475,17 +532,11 @@ pub(crate) fn detach(lists: &[This]) -> (Vec<Detached>, Vec<usize>) {
             order.push(i);
             continue;
         }
-        let Some(fresh) = fresh_list() else {
-            continue;
-        };
-        // A new host list is open; the title's next call on its list is a
-        // reset, which wants it closed.
-        fresh.close();
         let list = this.cast_mut().cast::<List>();
         // SAFETY: one of our lists, closed and submitted: nothing records
         // into it until the title resets it.
         let (host, uploads, state) = unsafe {
-            let Some(host) = (*list).host.replace(fresh) else {
+            let Some(host) = take_host(&mut *list) else {
                 continue;
             };
             let uploads =
@@ -625,6 +676,8 @@ fn boxed(kind: u32, pipeline: This, thin: bool) -> Box<List> {
         gate: Vec::new(),
         #[cfg(windows)]
         thin: Default::default(),
+        #[cfg(windows)]
+        parked: false,
     });
     #[cfg(not(windows))]
     let _ = pipeline;
@@ -685,9 +738,21 @@ extern "system" fn reset(this: This, allocator: This, pipeline: This) -> HRESULT
         list.earlier.clear();
         list.gate.clear();
     }
+    // A parked list takes a host list now, open and empty already.
+    #[cfg(windows)]
+    let reopened = {
+        // SAFETY: as above.
+        let list = unsafe { &mut *this.cast_mut().cast::<List>() };
+        std::mem::take(&mut list.parked) && {
+            list.host = fresh_list();
+            list.host.is_some()
+        }
+    };
     #[cfg(windows)]
     with_state(this, |host, state| {
-        host.reset();
+        if !reopened {
+            host.reset();
+        }
         state.reset(pipeline);
     });
     crate::pipeline::bound(pipeline);
