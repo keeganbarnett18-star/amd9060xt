@@ -144,6 +144,34 @@ fn packed() -> bool {
     *ON.get_or_init(|| std::env::var_os("VICTORY_TEXTURE_PACK").is_none_or(|v| v != "0"))
 }
 
+/// Whether a block of textures holds pieces of one size class only
+/// ([`class_of`]; `VICTORY_TEXTURE_CLASSES=0`: of any size, as before).
+///
+/// Mixed, the small textures fill the holes the large ones leave, and a
+/// hole so filled never grows back to a large texture's size: in sessions
+/// play50 to play54 the blocks held 7.0 to 7.9 GB in 8.8 to 9.5, the 1.7 to
+/// 2 GB of room lay in 2,000 to 4,300 free ranges (the largest of each
+/// block summed 320 to 970 MB), new blocks were made for textures that fit
+/// in none (151 in five minutes of play54), and the card stood at 96 % of
+/// its budget with a seventh of it air. `tests::classes_leave_less_air`
+/// plays a world's streaming against both.
+fn classes() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_TEXTURE_CLASSES").is_none_or(|v| v != "0"))
+}
+
+/// The size class of a piece of `len` bytes, of a block of `size`: 1 under
+/// 1/128 of a block (512 KiB of 64 MiB), 2 under 1/16 (4 MiB), 3 above.
+fn class_of(len: u64, size: u64) -> u8 {
+    if len < size / 128 {
+        1
+    } else if len < size / 16 {
+        2
+    } else {
+        3
+    }
+}
+
 /// Blocks of textures emptied whole after [`drain`] since the start.
 pub(crate) static DRAINED: AtomicU64 = AtomicU64::new(0);
 
@@ -219,6 +247,9 @@ struct Block<B> {
     held: u64,
     /// Being emptied ([`drain`]): no new pieces are cut from it.
     draining: bool,
+    /// The size class of its pieces ([`class_of`]), set when a piece is cut
+    /// from it whole; 0: any.
+    class: u8,
     /// The newest submission begun when it was made ([`Ripe`]).
     made: u64,
     /// When that was (ms).
@@ -237,11 +268,67 @@ struct Pool<B> {
     retry_growth_at: u64,
     /// Bytes of each of its blocks.
     size: u64,
+    /// Whether a block holds pieces of one size class ([`classes`]).
+    classes: bool,
 }
 
 impl<B: Clone> Pool<B> {
     const fn new(most: usize) -> Pool<B> {
-        Pool { blocks: Vec::new(), resting: VecDeque::new(), spare: 0, most, retry_growth_at: 0, size: BLOCK }
+        Pool { blocks: Vec::new(), resting: VecDeque::new(), spare: 0, most, retry_growth_at: 0, size: BLOCK, classes: false }
+    }
+
+    /// A place for `len` bytes in a block that is ripe, not draining and of
+    /// size class `class` (0: any; a whole block is of any): in the fullest
+    /// with room ([`packed`]; else the first), else, with blocks made ahead,
+    /// in the one that has been there the longest. The block and the place,
+    /// taken from its free ranges.
+    fn place(&mut self, len: u64, align: u64, ripe: Ripe, class: u8) -> Option<(usize, u64)> {
+        let size = self.size;
+        let of_class = |block: &Block<B>| class == 0 || block.class == class || block.free.whole(size);
+        // A piece cut from a whole block makes the block of its class.
+        let cut = |block: &mut Block<B>| {
+            let whole = block.free.whole(size);
+            let start = block.free.take(len, align)?;
+            if whole {
+                block.class = class;
+            }
+            Some(start)
+        };
+        // The fullest block that has room: what is let go then leaves the
+        // emptier blocks whole sooner.
+        let pack = packed();
+        let mut found = None;
+        let mut best: Option<(u64, usize)> = None;
+        for (i, block) in self.blocks.iter_mut().enumerate() {
+            if let Some(block) = block
+                && ripe.is(block)
+                && !block.draining
+                && of_class(block)
+            {
+                if pack {
+                    if best.is_none_or(|(held, _)| block.held > held) && block.free.fits(len, align) {
+                        best = Some((block.held, i));
+                    }
+                } else if let Some(start) = cut(block) {
+                    found = Some((i, start));
+                    break;
+                }
+            }
+        }
+        if let Some((_, i)) = best {
+            found = self.blocks[i].as_mut().and_then(|b| Some((i, cut(b)?)));
+        }
+        if found.is_none() && ripe.ahead > 0 {
+            // The one that has been there the longest.
+            let mut unripe: Vec<(u64, usize)> =
+                self.blocks.iter().enumerate().filter_map(|(i, b)| Some((b.as_ref()?.made, i))).collect();
+            unripe.sort_unstable();
+            found = unripe.into_iter().find_map(|(_, i)| {
+                let block = self.blocks[i].as_mut().filter(|b| !b.draining && of_class(b))?;
+                Some((i, cut(block)?))
+            });
+        }
+        found
     }
 
     /// A piece of `len` bytes and the memory it lies in, and whether that
@@ -266,42 +353,10 @@ impl<B: Clone> Pool<B> {
             return None;
         }
         self.rested(now);
-        // The fullest block that has room ([`packed`]; else the first):
-        // what is let go then leaves the emptier blocks whole sooner.
-        let pack = packed();
-        let mut found = None;
-        let mut best: Option<(u64, usize)> = None;
-        for (i, block) in self.blocks.iter_mut().enumerate() {
-            if let Some(block) = block
-                && ripe.is(block)
-                && !block.draining
-            {
-                if pack {
-                    if best.is_none_or(|(held, _)| block.held > held) && block.free.fits(len, align) {
-                        best = Some((block.held, i));
-                    }
-                } else if let Some(start) = block.free.take(len, align) {
-                    found = Some((i, start));
-                    break;
-                }
-            }
-        }
-        if let Some((_, i)) = best {
-            found = self.blocks[i].as_mut().and_then(|b| Some((i, b.free.take(len, align)?)));
-        }
-        if found.is_none() && ripe.ahead > 0 {
-            // The one that has been there the longest.
-            let mut unripe: Vec<(u64, usize)> =
-                self.blocks.iter().enumerate().filter_map(|(i, b)| Some((b.as_ref()?.made, i))).collect();
-            unripe.sort_unstable();
-            found = unripe.into_iter().find_map(|(_, i)| {
-                let block = self.blocks[i].as_mut().filter(|b| !b.draining)?;
-                Some((i, block.free.take(len, align)?))
-            });
-        }
+        let class = if self.classes { class_of(len, self.size) } else { 0 };
         // A failed 64 MiB block must not trigger another driver call for each
         // small texture. Existing free ranges remain usable during backoff.
-        let (i, start) = match found {
+        let (i, start) = match self.place(len, align, ripe, class) {
             Some(found) => found,
             None => {
                 GROWN[0].fetch_add(1, Ordering::Relaxed);
@@ -309,9 +364,18 @@ impl<B: Clone> Pool<B> {
                 if len < (1 << 20) {
                     GROWN[2].fetch_add(1, Ordering::Relaxed);
                 }
-                let memory = self.grow(now, &mut make)?;
-                let i = self.add(memory, ripe.started);
-                (i, self.blocks[i].as_mut()?.free.take(len, align)?)
+                match self.grow(now, &mut make) {
+                    Some(memory) => {
+                        let i = self.add(memory, ripe.started);
+                        let block = self.blocks[i].as_mut()?;
+                        block.class = class;
+                        (i, block.free.take(len, align)?)
+                    }
+                    // No new block: a place among another class's pieces
+                    // rather than none.
+                    None if class != 0 => self.place(len, align, ripe, 0)?,
+                    None => return None,
+                }
             }
         };
         if ripe.ahead > 0 {
@@ -354,7 +418,7 @@ impl<B: Clone> Pool<B> {
                 self.blocks.len() - 1
             }
         };
-        self.blocks[i] = Some(Block { memory, free: Ranges::new(self.size), used_to: 0, held: 0, draining: false, made, since: crate::host::now_ms() });
+        self.blocks[i] = Some(Block { memory, free: Ranges::new(self.size), used_to: 0, held: 0, draining: false, class: 0, made, since: crate::host::now_ms() });
         i
     }
 
@@ -464,6 +528,20 @@ pub(crate) fn texture_fill() -> ([u32; 11], usize, u64, usize) {
         largest += block.free.0.values().copied().max().unwrap_or(0);
     }
     (tenths, ranges, largest >> 20, pool.resting.len())
+}
+
+/// For the memory line: by size class ([`class_of`]; the first is blocks of
+/// no class), the blocks of textures and the MiB their pieces hold.
+#[cfg(feature = "diagnostics")]
+pub(crate) fn texture_classes() -> [(u32, u64); 4] {
+    let pool = lock(&TEXTURES);
+    let mut by = [(0u32, 0u64); 4];
+    for block in pool.blocks.iter().flatten() {
+        let class = if block.free.whole(pool.size) { 0 } else { usize::from(block.class.min(3)) };
+        by[class].0 += 1;
+        by[class].1 += block.held;
+    }
+    by.map(|(blocks, held)| (blocks, held >> 20))
 }
 
 /// The block of textures `texture` lies in and the bytes of its piece, if
@@ -649,6 +727,7 @@ pub(crate) unsafe fn texture(
     let (piece, heap, again) = {
         let mut pool = lock(&TEXTURES);
         pool.size = texture_block();
+        pool.classes = classes();
         pool
     }
     .take_ripe(info.SizeInBytes, info.Alignment.max(1), now(), Ripe::now(), || {
@@ -724,6 +803,94 @@ mod tests {
         assert!(!r.whole(1024));
         r.give(100, 28);
         assert!(r.whole(1024));
+    }
+
+    /// A world's streaming played against the pool: textures of a play's
+    /// sizes (many small, few large; 300 to 500 KiB on average, as in
+    /// sessions play50 to play54) come until `live` bytes are held, each
+    /// for a time of its own (seconds for what passes by, minutes for what
+    /// stays), ten looks a second for `seconds`. Returns the blocks' bytes
+    /// and the bytes held, both averaged over the second half, and the
+    /// blocks made in all.
+    fn streamed(classes: bool, small_stay: bool, live: u64, seconds: u64) -> (u64, u64, u64) {
+        let mut pool: Pool<u64> = Pool::new(SPARE_KEPT);
+        pool.classes = classes;
+        let made = std::cell::Cell::new(0u64);
+        let make = || {
+            made.set(made.get() + 1);
+            Some(made.get())
+        };
+        let mut seed = 0x9e37_79b9_7f4a_7c15u64;
+        let mut random = move || {
+            seed ^= seed << 13;
+            seed ^= seed >> 7;
+            seed ^= seed << 17;
+            seed
+        };
+        // (bytes, of a thousand): block-compressed textures with their levels.
+        const SIZES: [(u64, u64); 6] = [(22 << 10, 350), (87 << 10, 300), (350 << 10, 220), (1400 << 10, 100), (5600 << 10, 25), (22 << 20, 5)];
+        let mut alive: Vec<(u64, Piece)> = Vec::new();
+        let (mut held, mut blocks_sum, mut held_sum, mut looks) = (0u64, 0u64, 0u64, 0u64);
+        for tick in 0..seconds * 10 {
+            let now = tick * 100;
+            let mut i = 0;
+            while i < alive.len() {
+                if alive[i].0 <= now {
+                    let (_, piece) = alive.swap_remove(i);
+                    held -= piece.len;
+                    pool.give(piece, now);
+                } else {
+                    i += 1;
+                }
+            }
+            while held < live {
+                let mut pick = random() % 1000;
+                let len = SIZES.iter().find(|&&(_, share)| if pick < share { true } else { pick -= share; false }).map_or(22 << 10, |s| s.0);
+                let align = if len <= 64 << 10 { 4096 } else { 65536 };
+                let len = len.next_multiple_of(align);
+                // A third passes by in 5 to 20 s, half in 30 to 120 s, a
+                // fifth stays 5 to 20 minutes; with `small_stay` the small
+                // ones are what stays.
+                let kind = random() % 100;
+                let stays = if small_stay { len < 512 << 10 && kind < 40 } else { kind >= 80 };
+                let ms = if stays {
+                    300_000 + random() % 900_000
+                } else if kind < 30 {
+                    5_000 + random() % 15_000
+                } else {
+                    30_000 + random() % 90_000
+                };
+                let (piece, _, _) = pool.take(len, align, now, make).unwrap();
+                held += piece.len;
+                alive.push((now + ms, piece));
+            }
+            if tick >= seconds * 5 {
+                blocks_sum += pool.blocks() as u64 * pool.size;
+                held_sum += held;
+                looks += 1;
+            }
+        }
+        (blocks_sum / looks, held_sum / looks, made.get())
+    }
+
+    /// With a block for each size class less of the blocks is air, whether
+    /// what stays is of every size or the small textures.
+    #[test]
+    fn classes_leave_less_air() {
+        for small_stay in [false, true] {
+            let (mixed, held, mixed_made) = streamed(false, small_stay, 2 << 30, 1200);
+            let (apart, held_apart, apart_made) = streamed(true, small_stay, 2 << 30, 1200);
+            println!(
+                "small textures stay: {small_stay}; mixed: {} MB of blocks for {} MB held ({} blocks made); by class: {} MB for {} MB ({} made)",
+                mixed >> 20,
+                held >> 20,
+                mixed_made,
+                apart >> 20,
+                held_apart >> 20,
+                apart_made
+            );
+            assert!(apart <= mixed, "by class {apart} against {mixed}");
+        }
     }
 
     #[test]

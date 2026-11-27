@@ -811,6 +811,13 @@ fn log_memory() {
             crate::pool::GROWN[2].load(Relaxed)
         );
         tracing::info!(
+            "blocks of textures by the size of their pieces (VICTORY_TEXTURE_CLASSES=0: any size in any block), as (blocks, MB held): empty or of any size {:?}, under 1/128 of a block {:?}, under 1/16 {:?}, larger {:?}",
+            crate::pool::texture_classes()[0],
+            crate::pool::texture_classes()[1],
+            crate::pool::texture_classes()[2],
+            crate::pool::texture_classes()[3]
+        );
+        tracing::info!(
             "memory in blocks (VICTORY_TEXTURE_POOL=0 turns them off): {textures} MB of textures ({held} MB of them held), {staging} MB of their staging buffers; emptied to stay under the card's budget (VICTORY_FREE_BLOCKS=0: not) since the start: {blocks} blocks drained, {copies} host copies moved out of them, {drained} blocks emptied"
         );
     }
