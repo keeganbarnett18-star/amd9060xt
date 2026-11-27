@@ -205,6 +205,29 @@ enum Blob {
     Mapped(Mapped),
 }
 
+/// Whether a library of `len` bytes ends within a dword of a page's end
+/// (or on it): AMD's driver reads a dword at the blob's end inside
+/// `CreatePipelineLibrary`, which for a mapped file of such a length falls
+/// on the page after the view, unmapped, and every start crashed until the
+/// file was deleted (XCL's PR #2859 found it; this is our own code).
+fn past_its_page(len: u64) -> bool {
+    matches!(len % 4096, 0 | 4093..=4095)
+}
+
+/// The file at `path` read into memory with a dword of room after its end
+/// ([`past_its_page`]).
+fn read_with_room(path: &std::path::Path) -> Option<Vec<u8>> {
+    use std::io::Read;
+    let mut file = std::fs::File::open(path).ok()?;
+    let len = file.metadata().ok()?.len() as usize;
+    let mut bytes = Vec::with_capacity(len + 4);
+    file.read_to_end(&mut bytes).ok()?;
+    if bytes.capacity() < bytes.len() + 4 {
+        bytes.reserve_exact(4);
+    }
+    Some(bytes)
+}
+
 impl Blob {
     /// The library file in `dir`: a library a save left beside it
     /// ([`NEXT_FILE`]) takes its place first.
@@ -214,13 +237,15 @@ impl Blob {
         if next.exists() && std::fs::rename(&next, &path).is_err() {
             tracing::warn!("the host pipeline library saved last could not take the old one's place");
         }
+        let len = std::fs::metadata(&path).map_or(0, |m| m.len());
         if mapped()
+            && !past_its_page(len)
             && let Some(file) = Mapped::open(&path)
         {
             return Blob::Mapped(file);
         }
-        match std::fs::read(&path) {
-            Ok(bytes) if !bytes.is_empty() => Blob::Held(bytes),
+        match read_with_room(&path) {
+            Some(bytes) if !bytes.is_empty() => Blob::Held(bytes),
             _ => Blob::None,
         }
     }
@@ -783,6 +808,23 @@ pub(crate) fn note_used(key: &str) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A library ending within a dword of a page's end is not mapped, and
+    /// one read has a dword of room after it.
+    #[test]
+    fn a_library_at_a_page_end_is_read_with_room() {
+        assert!(past_its_page(4096));
+        assert!(past_its_page(8192 - 1));
+        assert!(past_its_page(8192 - 3));
+        assert!(!past_its_page(8192 - 4));
+        assert!(!past_its_page(472_598));
+        let path = std::env::temp_dir().join(format!("victory-library-room-{}.bin", std::process::id()));
+        std::fs::write(&path, vec![7u8; 4093]).unwrap();
+        let bytes = read_with_room(&path).unwrap();
+        std::fs::remove_file(&path).ok();
+        assert_eq!(bytes.len(), 4093);
+        assert!(bytes.capacity() >= 4097);
+    }
 
     #[test]
     fn names_change_with_what_goes_into_the_pipeline() {
