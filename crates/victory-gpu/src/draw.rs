@@ -112,6 +112,8 @@ impl TableGroup {
     }
 }
 
+mod bvh_copy;
+
 /// A root argument as the title set it.
 #[derive(Debug, Clone, Default)]
 enum Root {
@@ -3206,7 +3208,26 @@ impl State {
             once!("a dispatch with a graphics pipeline");
             return;
         }
+        // Counted in threads: whole groups of them, and the program is told
+        // how many of the last one run, where it asks (its `bind` set that to
+        // all of them).
+        let size = (flags & THREAD_DIMENSIONS != 0 && thread_dimensions())
+            .then(|| p.stages.first().and_then(|s| s.translated().threads))
+            .flatten();
+        let threads = [x, y, z];
+        let groups = size.map_or(threads, |size| dispatch_groups(threads, size));
+        // The structure builder's copy, by a pass of ours recorded before
+        // the program is bound (`VICTORY_BVH_COPY`, [`bvh_copy`]; xeltax/vicky
+        // eb6a31a0). Threads that end inside a group run translated.
+        let partial = match size {
+            Some(size) if (0..3).any(|i| groups[i].saturating_mul(size[i]) != threads[i]) => threads,
+            _ => [0; 3],
+        };
+        let ours = self.bvh_copy_before(list, p, groups, partial);
         if !self.bind(list, p, true) {
+            if let Some(ours) = &ours {
+                self.bvh_copy_dropped(list, ours);
+            }
             DROPPED.fetch_add(1, Ordering::Relaxed);
             // A stage of the structure builder that cannot be bound is a
             // dropped stage: the others stop too.
@@ -3222,14 +3243,7 @@ impl State {
             crate::capture::op(list as *const _ as usize, || format!("builder {}", p.name));
             self.list_dropped_roots([x, y, z]);
         }
-        // Counted in threads: whole groups of them, and the program is told
-        // how many of the last one run, where it asks (its `bind` set that to
-        // all of them).
-        let size = (flags & THREAD_DIMENSIONS != 0 && thread_dimensions())
-            .then(|| p.stages.first().and_then(|s| s.translated().threads))
-            .flatten();
-        let threads = [x, y, z];
-        let [x, y, z] = size.map_or(threads, |size| dispatch_groups(threads, size));
+        let [x, y, z] = groups;
         if size.is_some() {
             if !crate::pipeline::is_builder(self.pipeline as This) {
                 once!(pipeline = p.name, "a dispatch counted in threads that is not the structure builder's");
@@ -3239,8 +3253,11 @@ impl State {
                 unsafe { list.list.SetComputeRoot32BitConstant(param, threads[0], word) };
             }
         }
-        // SAFETY: an open list with everything set.
-        unsafe { list.list.Dispatch(x, y, z) };
+        match &ours {
+            Some(ours) => self.bvh_copy_after(list, ours, [x, y, z]),
+            // SAFETY: an open list with everything set.
+            None => unsafe { list.list.Dispatch(x, y, z) },
+        }
         self.buffers_written();
         DISPATCHED.fetch_add(1, Ordering::Relaxed);
         if let Some(role) = p.stages.first().and_then(|s| s.shader.ambient)

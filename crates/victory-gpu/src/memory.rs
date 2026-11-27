@@ -1242,6 +1242,45 @@ pub(crate) fn ready(
     })
 }
 
+/// For a pass of ours that stands in for a translated program reading and
+/// writing title memory by address (`crate::draw`'s `bvh_copy`): how many
+/// bytes from `address` on, at most `most`, lie on pages the directory
+/// gives to `shadow` at the offsets `shadow` holds them (for a store
+/// (`write`), pages stores reach: not closed), so that the pass reaches the
+/// very bytes the program would; with the number the directory gives the
+/// copy and the GPU address of the faults' buffer. None without a directory,
+/// or when the page of `address` is not `shadow`'s.
+///
+/// From xeltax/vicky eb6a31a0 (GPL-3.0-or-later), on our directory: its
+/// entries are ours to read here (`entry`), the number with
+/// [`MEMORY_READ_ONLY`] for a closed page, and our programs leave no touch
+/// or page marks, so the notes' address is only somewhere harmless to point
+/// at.
+pub(crate) fn run_in(shadow: &Arc<Shadow>, address: u64, most: u64, write: bool) -> Option<(u64, u32, u64)> {
+    let guard = MEMORY.lock().unwrap_or_else(|e| e.into_inner());
+    let m = guard.as_ref()?;
+    let (start, len) = shadow.span();
+    let end = address.saturating_add(most).min(start + len);
+    let (mut page, mut reach, mut number) = (address / PAGE, address, None);
+    while reach < end && page < u64::from(MEMORY_PAGES) - 1 {
+        // SAFETY: an entry of the directory, under the mutex; entries are
+        // written on this side only.
+        let (n, offset) = unsafe { (m.entry(page).read(), m.entry(page).add(1).read()) };
+        let closed = n & MEMORY_READ_ONLY != 0;
+        let n = n & !MEMORY_READ_ONLY;
+        let ours = n != 0
+            && !(write && closed)
+            && m.copies.get(n as usize - 1).is_some_and(|c| Arc::ptr_eq(c, shadow))
+            && shadow.offset_in(page * PAGE) == Some(u64::from(offset));
+        if !ours {
+            break;
+        }
+        number.get_or_insert(n);
+        reach = ((page + 1) * PAGE).min(end);
+        page += 1;
+    }
+    Some((reach - address, number?, m.faults.2))
+}
 /// `VICTORY_BVH_TRACE=1`: the sizes the builder is asked for (its program of
 /// one thread that stores a structure's compacted size) and when title memory
 /// has them, and the copies to a place of that size.
