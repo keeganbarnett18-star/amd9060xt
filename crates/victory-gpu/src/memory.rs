@@ -796,6 +796,23 @@ impl Memory {
 /// A list with this key ([`HostList::used`]) asks the builder for sizes.
 const SIZES: usize = usize::MAX - (9 << 33);
 
+/// The key ([`HostList::first_use`]) of title address `at` for the purpose
+/// `kind` (4: a structure the builder writes, 5: the small title buffer it is
+/// in), on the whole address in dwords.
+///
+/// The keys were `(at >> 2) & 0x7FFF_FFFF` under `kind << 33`: 31 bits of a
+/// dword's index are 8 GiB of addresses, so two structures 8 GiB apart in one
+/// list had one key, and the second lost its preparation for the builder's
+/// stores and its small buffer's way back (the size the title reads)
+/// (avatarmanz/VIctory-7900XTX issue #202). A title address has 40 bits, its
+/// dword index 38: each purpose has 2^40 keys of its own, all of them above
+/// the other keys of this module (`kind << 33`, at most `9 << 33`) and far
+/// above the pointers and the texture keys (`1 << 63` and a pointer) other
+/// modules ask with.
+fn address_key(kind: usize, at: u64) -> usize {
+    usize::MAX - (kind << 40) - (at >> 2 & ((1 << 38) - 1)) as usize
+}
+
 /// Whether a submission that asks for the sizes of structures is waited for,
 /// and landed, before the title goes on (`VICTORY_BVH_SIZES_WAIT=1`; off).
 ///
@@ -986,11 +1003,11 @@ pub(crate) fn ready(
             });
             m.bring_up(list);
         }
-        if builds && written.contains(&at) && list.first_use(usize::MAX - (4 << 33) - (at >> 2 & 0x7FFF_FFFF) as usize) {
+        if builds && written.contains(&at) && list.first_use(address_key(4, at)) {
             if let Some((start, len)) = crate::shadow::in_buffer(at, 1)
                 && len <= BACK
                 && use_ == (Use::Builds { back: true })
-                && list.first_use(usize::MAX - (5 << 33) - (start >> 2 & 0x7FFF_FFFF) as usize)
+                && list.first_use(address_key(5, start))
             {
                 m.small(list, start, len);
             }
@@ -1300,5 +1317,28 @@ mod tests {
         assert_eq!(packed_len(header(0x8102_0007, 5)), None);
         assert_eq!(packed_len(header(0x8102_0006, 0)), None);
         assert_eq!(packed_len(header(0x8102_0006, 1 << 21)), None);
+    }
+
+    /// Two structures 8 GiB apart in one list are two keys (issue #202 of
+    /// avatarmanz/VIctory-7900XTX), and no key of one purpose is one of
+    /// another or of the module's other keys.
+    #[test]
+    fn structures_8_gib_apart_are_keyed_apart() {
+        let at = 0x12_3456_7800u64;
+        for far in [8u64 << 30, 16 << 30, 1 << 38] {
+            assert_ne!(address_key(4, at), address_key(4, at + far));
+            assert_ne!(address_key(5, at), address_key(5, at + far));
+        }
+        // Dwords apart are apart; within a dword, one.
+        assert_ne!(address_key(4, at), address_key(4, at + 4));
+        assert_eq!(address_key(4, at), address_key(4, at + 3));
+        // The ranges of the purposes, over the whole 40-bit space.
+        let range = |kind| address_key(kind, (1 << 40) - 4)..=address_key(kind, 0);
+        let (four, five) = (range(4), range(5));
+        assert!(five.end() < four.start());
+        // Below the module's other keys (`kind << 33`, the most 9; pages
+        // `kind << 26`), above a texture's (`1 << 63` with a pointer).
+        assert!(four.end() < &(usize::MAX - (9 << 33) - (1 << 33)));
+        assert!(five.start() > &(1usize << 63 | (1 << 52)));
     }
 }
