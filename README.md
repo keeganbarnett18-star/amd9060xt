@@ -40,6 +40,29 @@ shader caches; from the second session on it is back to normal.
 - **Menus are laid out slightly too large** (left edge cut off in Settings), and
   the game runs in a window, not fullscreen.
 
+## Roadmap
+
+The goal is the best of both: a good picture (textures that stay sharp, light
+that looks right) and steady, stable play on this PC, with little to no
+graphics bugs and no crashes. A steady 20 to 25 fps counts for more than a
+higher number that jumps around.
+
+1. **Now: picture and stability.** Textures that no longer go blurry, black or
+   stale as a session goes on, lighting without rays that holds steady, the
+   interface at the right size; then the title's own ray tracing as an option
+   of its own, kept off until runs show it stable.
+2. **Next: the processor's share of a frame**, aiming at a steady 25 to 30 fps.
+   The card is only about half busy; the processor spends some 33 to 37 ms a
+   frame preparing it, most of that keeping the console's shared memory in
+   step with the card's (copies, write tracking, page guards). The plan: copy
+   only what changed, spread the work over more cores, track changes more
+   cheaply.
+3. **Then:** stand-in pipelines while new shaders build (less pop-in in places
+   not seen before), and frame pacing if it is still uneven.
+
+60 fps in the open world is not in sight with this design: every frame pays
+for keeping two memories in step, which the console does not have to do.
+
 ## What this fork changes
 
 Each change was measured before it was kept; numbers are in the commit messages
