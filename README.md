@@ -92,7 +92,7 @@ The memory work in detail, kept up to date as it goes:
    wait). Next: the card reads the game's memory where it lies instead of
    through copies (about 3.4 GB of RAM less and far less to track), textures
    moved on the card instead of through RAM, and fewer memory calls a frame.
-   Then:  The card's memory kept
+   Then: the card's memory kept
    with room to spare in the open world, so textures no longer go blurry, black
    or stale as a session goes on and frames stay even; lighting without rays
    that holds steady (done: the stand-in light with a bounded haze and held
