@@ -70,7 +70,7 @@ model 6.6 and mesh shaders, Rust (1.98 or newer) with the MSVC build tools, and
 your own dump of the game.
 
 ```powershell
-git clone https://github.com/keeganbarnett18-star/amd9060xt.git
+git clone https://github.com/notxuesty/amd9060xt.git
 cd amd9060xt
 cargo build --release --locked -p victory
 powershell -ExecutionPolicy Bypass -File scripts\get-agility.ps1
