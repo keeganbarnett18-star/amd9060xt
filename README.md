@@ -79,7 +79,20 @@ that looks right) and steady, stable play on this PC, with little to no
 graphics bugs and no crashes. A steady 20 to 25 fps counts for more than a
 higher number that jumps around.
 
-1. **Now: video memory, then picture and stability.** The card's memory kept
+The memory work in detail, kept up to date as it goes:
+[docs/unified-memory-plan.md](docs/unified-memory-plan.md) (the plan) and
+[docs/memory-handoff.md](docs/memory-handoff.md) (what each test session showed).
+
+1. **Now: memory, then picture and stability.** The console has one 16 GB
+   memory for the processor and the graphics chip; a PC has two, so every
+   texture lives once in the game's RAM and again on the card, and what the
+   game changes has to be tracked and copied. Driving is where it shows: while
+   the world streams in, the game remaps its memory constantly and frames drop
+   to 10-20 fps (session play58 proved the remapping, not our copying, is the
+   wait). Next: the card reads the game's memory where it lies instead of
+   through copies (about 3.4 GB of RAM less and far less to track), textures
+   moved on the card instead of through RAM, and fewer memory calls a frame.
+   Then:  The card's memory kept
    with room to spare in the open world, so textures no longer go blurry, black
    or stale as a session goes on and frames stay even; lighting without rays
    that holds steady (done: the stand-in light with a bounded haze and held
