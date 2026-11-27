@@ -48,6 +48,17 @@
 //!   copies nothing, sets its record's flag and counts it; the program's
 //!   dispatch is predicated on that flag, so it runs only then.
 //!
+//! **Copies onto themselves** (`VICTORY_BVH_COPY=skip`, and `native`):
+//! the title refits its structures in place, so the source and the
+//! destination are one title address (every copy logged on the 4080, RT31).
+//! With `c1` unset the program then writes back, at the same offsets, the
+//! bytes it has just read: nothing changes. Such a dispatch is not recorded
+//! at all ([`State::bvh_copy_skips`]), which also spares the notes and
+//! page marks that would have the host copy those pages back. `skip` does
+//! only that and leaves every other copy to the program (xeltax/vicky
+//! 7f78f843, GPL-3.0-or-later; here there are no notes or marks to spare,
+//! but the dispatch's directory loads and `crate::memory::ready` are).
+//!
 //! **The check** (`VICTORY_BVH_COPY=check`): ours copies into a buffer in
 //! the card's memory (64 MiB, [`SCRATCH`]), the translated program runs as
 //! before, and a compare counts the dwords that differ. The counts are
@@ -219,12 +230,15 @@ pub(super) enum Mode {
     Native,
     /// Ours copies aside, the program as before, and the two are compared.
     Check,
+    /// Copies onto themselves are not recorded; the others run translated.
+    Skip,
 }
 
 pub(super) fn parse_mode(value: &str) -> Option<Mode> {
     match value.trim() {
         "native" => Some(Mode::Native),
         "check" => Some(Mode::Check),
+        "skip" => Some(Mode::Skip),
         _ => None,
     }
 }
@@ -242,7 +256,7 @@ fn mode() -> Option<Mode> {
             None if !value.trim().is_empty() => {
                 tracing::warn!(
                     value,
-                    "VICTORY_BVH_COPY is neither native nor check: the copy runs translated"
+                    "VICTORY_BVH_COPY is not native, check or skip: the copy runs translated"
                 )
             }
             None => {}
@@ -651,10 +665,72 @@ pub(super) struct Recorded {
 }
 
 /// Counted here since the start: dispatches of the program, the ones ours
-/// was recorded for, the ones left to the program at recording.
-static TALLY: [AtomicU64; 3] = [const { AtomicU64::new(0) }; 3];
+/// was recorded for, the ones left to the program at recording, the ones
+/// not recorded as copies onto themselves.
+const TALLIES: usize = 4;
+static TALLY: [AtomicU64; TALLIES] = [const { AtomicU64::new(0) }; TALLIES];
+
+/// Whether a dispatch copies a structure onto itself: the source and the
+/// destination views (two root parameters) at one title address, and
+/// constant 1 unset (no bounds written). The program then writes back the
+/// bytes it reads.
+pub(super) fn onto_itself((src_slot, dst_slot): (u8, u8), src: u64, dst: u64, c1: u32) -> bool {
+    src_slot != dst_slot && src == dst && c1 == 0
+}
 
 impl State {
+    /// Before a dispatch's program is bound: true if it is the builder's
+    /// copy of a structure onto itself ([`onto_itself`]) and
+    /// `VICTORY_BVH_COPY` is `skip` or `native`. The caller then records
+    /// nothing for it.
+    pub(super) fn bvh_copy_skips(&self, p: &HostPipeline, partial: [u32; 3]) -> bool {
+        let Some(mode @ (Mode::Native | Mode::Skip)) = mode() else {
+            return false;
+        };
+        let Some(stage) = p.stages.first() else {
+            return false;
+        };
+        if stage.shader.hash != HASH {
+            return false;
+        }
+        let t = stage.translated();
+        let Some(threads) = t.threads else {
+            return false;
+        };
+        let Ok((src_slot, dst_slot, constants_slot)) = slots(&t.used, threads, partial) else {
+            return false;
+        };
+        let roots = self.roots_ref(true);
+        let view = |slot: u8| match roots.get(usize::from(slot)) {
+            Some(&Root::View(address)) => Some(address),
+            _ => None,
+        };
+        let (Some(src), Some(dst)) = (view(src_slot), view(dst_slot)) else {
+            return false;
+        };
+        let Some(Root::Constants(words)) = roots.get(usize::from(constants_slot)) else {
+            return false;
+        };
+        let c1 = words.get(1).copied().unwrap_or(0);
+        if !onto_itself((src_slot, dst_slot), src, dst, c1) {
+            return false;
+        }
+        frame_line();
+        TALLY[0].fetch_add(1, Ordering::Relaxed);
+        TALLY[3].fetch_add(1, Ordering::Relaxed);
+        static SAID: std::sync::Once = std::sync::Once::new();
+        SAID.call_once(|| {
+            tracing::info!(
+                ?mode,
+                src_slot,
+                dst_slot,
+                address = format_args!("{src:#x}"),
+                "VICTORY_BVH_COPY: a structure copy onto itself is not recorded (it writes back the bytes it reads; logged once)"
+            )
+        });
+        true
+    }
+
     /// Before a dispatch's program is bound: for the builder's copy with
     /// `VICTORY_BVH_COPY` set, ours is recorded (the list's root signature
     /// and pipeline are ours after it, and the next bind sets the title's
@@ -674,6 +750,10 @@ impl State {
         }
         frame_line();
         TALLY[0].fetch_add(1, Ordering::Relaxed);
+        if mode == Mode::Skip {
+            fell_back("VICTORY_BVH_COPY=skip leaves copies to other places to the program");
+            return None;
+        }
         match self.bvh_copy_record(list, stage, groups, partial, mode) {
             Ok(recorded) => {
                 TALLY[1].fetch_add(1, Ordering::Relaxed);
@@ -761,7 +841,7 @@ impl State {
         };
         let l = &list.list;
         match ours.mode {
-            Mode::Native => predicated(l, &work.records, ours.record, [x, y, z]),
+            Mode::Native | Mode::Skip => predicated(l, &work.records, ours.record, [x, y, z]),
             Mode::Check => {
                 // SAFETY: an open list with the program bound.
                 unsafe {
@@ -825,7 +905,7 @@ fn fell_back(why: &'static str) {
 /// flight). The first 200 lines, then every 100th.
 fn frame_line() {
     static FRAME: AtomicU64 = AtomicU64::new(u64::MAX);
-    static BEFORE: Mutex<[u64; 3 + count::ALL]> = Mutex::new([0; 3 + count::ALL]);
+    static BEFORE: Mutex<[u64; TALLIES + count::ALL]> = Mutex::new([0; TALLIES + count::ALL]);
     static LINES: AtomicU32 = AtomicU32::new(0);
     let frame = crate::frame::current();
     if FRAME.swap(frame, Ordering::Relaxed) == frame {
@@ -835,17 +915,17 @@ fn frame_line() {
     // cannot come between.
     let mut before = BEFORE.lock().unwrap_or_else(|e| e.into_inner());
     let card = work().map_or([0; count::ALL], Work::counts);
-    let mut now = [0u64; 3 + count::ALL];
+    let mut now = [0u64; TALLIES + count::ALL];
     for (i, t) in TALLY.iter().enumerate() {
         now[i] = t.load(Ordering::Relaxed);
     }
     for (i, &c) in card.iter().enumerate() {
-        now[3 + i] = u64::from(c);
+        now[TALLIES + i] = u64::from(c);
     }
     // The card's counters are 32-bit and wrap.
     let d: Vec<u64> = (0..now.len())
         .map(|i| {
-            if i < 3 {
+            if i < TALLIES {
                 now[i].saturating_sub(before[i])
             } else {
                 u64::from((now[i] as u32).wrapping_sub(before[i] as u32))
@@ -866,14 +946,15 @@ fn frame_line() {
         dispatches = d[0],
         ours = d[1],
         translated = d[2],
-        copied = d[3 + count::DONE / 4],
-        too_long = d[3 + count::OVER / 4],
-        compared = d[3 + count::COMPARED / 4],
-        compared_kib = d[3 + count::DWORDS / 4] / 256,
-        differing_dwords = d[3 + count::DIFFERING / 4],
-        differing_copies = d[3 + count::COPIES_DIFFERING / 4],
-        not_compared = d[3 + count::NOT_COMPARED / 4],
-        "VICTORY_BVH_COPY, since the last line: the structure builder's copies (ours: recorded by us; translated: left to the program at recording; the card's counts lag a frame or two)"
+        skipped = d[3],
+        copied = d[TALLIES + count::DONE / 4],
+        too_long = d[TALLIES + count::OVER / 4],
+        compared = d[TALLIES + count::COMPARED / 4],
+        compared_kib = d[TALLIES + count::DWORDS / 4] / 256,
+        differing_dwords = d[TALLIES + count::DIFFERING / 4],
+        differing_copies = d[TALLIES + count::COPIES_DIFFERING / 4],
+        not_compared = d[TALLIES + count::NOT_COMPARED / 4],
+        "VICTORY_BVH_COPY, since the last line: the structure builder's copies (ours: recorded by us; translated: left to the program at recording; skipped: copies onto themselves, not recorded; the card's counts lag a frame or two)"
     );
 }
 

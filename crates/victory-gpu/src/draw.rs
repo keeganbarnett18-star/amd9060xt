@@ -3216,13 +3216,20 @@ impl State {
             .flatten();
         let threads = [x, y, z];
         let groups = size.map_or(threads, |size| dispatch_groups(threads, size));
-        // The structure builder's copy, by a pass of ours recorded before
-        // the program is bound (`VICTORY_BVH_COPY`, [`bvh_copy`]; xeltax/vicky
-        // eb6a31a0). Threads that end inside a group run translated.
+        // The structure builder's copy: onto itself it changes nothing and is
+        // not recorded (xeltax/vicky 7f78f843); otherwise by a pass of ours
+        // recorded before the program is bound (`VICTORY_BVH_COPY`,
+        // [`bvh_copy`]; xeltax/vicky eb6a31a0). Threads that end inside a
+        // group run translated.
         let partial = match size {
             Some(size) if (0..3).any(|i| groups[i].saturating_mul(size[i]) != threads[i]) => threads,
             _ => [0; 3],
         };
+        if self.bvh_copy_skips(p, partial) {
+            #[cfg(feature = "diagnostics")]
+            list.note_op(|| "structure copy onto itself, not recorded (VICTORY_BVH_COPY)".to_owned());
+            return;
+        }
         let ours = self.bvh_copy_before(list, p, groups, partial);
         if !self.bind(list, p, true) {
             if let Some(ours) = &ours {

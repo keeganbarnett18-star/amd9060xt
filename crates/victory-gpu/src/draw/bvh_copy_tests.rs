@@ -175,9 +175,10 @@ fn ours_takes_the_programs_views_from_its_table() {
 }
 
 #[test]
-fn the_switch_takes_native_and_check_only() {
+fn the_switch_takes_native_check_and_skip_only() {
     assert_eq!(parse_mode("native"), Some(Mode::Native));
     assert_eq!(parse_mode(" check "), Some(Mode::Check));
+    assert_eq!(parse_mode("skip"), Some(Mode::Skip));
     assert_eq!(parse_mode(""), None);
     assert_eq!(parse_mode("1"), None);
     assert_eq!(parse_mode("Native"), None);
@@ -655,4 +656,12 @@ on_both! {
     notes: leaves_the_programs_notes;
     predication: the_program_runs_only_where_ours_did_not;
     check: the_check_counts_differences;
+}
+
+#[test]
+fn onto_itself_needs_one_address_two_views_and_no_bounds() {
+    assert!(onto_itself((0, 1), 0x1000, 0x1000, 0));
+    assert!(!onto_itself((0, 1), 0x1000, 0x2000, 0), "another address");
+    assert!(!onto_itself((0, 1), 0x1000, 0x1000, 1), "bounds written");
+    assert!(!onto_itself((1, 1), 0x1000, 0x1000, 0), "one root parameter");
 }
