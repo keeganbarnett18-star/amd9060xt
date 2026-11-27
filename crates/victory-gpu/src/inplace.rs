@@ -75,9 +75,9 @@ pub(crate) fn probe_level() -> u8 {
 ///
 /// What it assumes, for 2: nothing reads title memory that a submission
 /// not yet run writes through such a buffer. With every submission waited
-/// for (the default) that holds; with `VICTORY_LATE_WAIT` it does not,
-/// since the flights' rules know shader writes only by the ranges copies
-/// declare. Do not combine 2 with late wait.
+/// for, that holds. With `VICTORY_LATE_WAIT`, shader writes through memory
+/// in place are now declared as in the air (`take_in_place` in host.rs).
+/// But 2 has not been run with late wait yet.
 ///
 /// shortcut: while a window is in place the title cannot decommit, free
 /// or protect its pages (the call fails with error 87; the probe shows
@@ -203,11 +203,17 @@ pub(crate) fn gone(window: bool, bytes: u64) {
 /// pages.
 ///
 /// What it assumes, as renderer port 1 does: the CPU steps of ours that
-/// read such memory at submission read what the title's CPU wrote. And, as
-/// [`level`] says for 2, that nothing reads title memory a submission not
-/// yet run writes through such a buffer, which `VICTORY_LATE_WAIT` breaks:
-/// with late wait nothing is placed here (one warning says so), since a
-/// window is not known to be only read when it is made.
+/// read such memory at submission read what the title's CPU wrote.
+///
+/// With `VICTORY_LATE_WAIT` (on with the relay), what shaders may write
+/// through such a buffer is declared as for a copy, but nothing is copied
+/// back (`take_in_place` in host.rs): it counts as in the air until the
+/// card has run the submission, so a step of ours that reads it waits.
+/// Before that was done, nothing was placed here with late wait.
+///
+/// Not covered: another host copy of the same bytes (a smaller buffer
+/// inside a window that has a copy of its own) does not learn what the
+/// card wrote here. [`written_ahead`] counts the writes.
 pub fn pool_in_place() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *ON.get_or_init(|| switch(std::env::var("VICTORY_POOL_IN_PLACE").ok().as_deref()))
@@ -242,11 +248,6 @@ static POOL: [AtomicU64; 6] = [const { AtomicU64::new(0) }; 6];
 /// `None` leaves the caller to do what it did before.
 pub(crate) fn pool_place_for(start: u64, len: u64, window: bool) -> Option<Placed> {
     if !pool_in_place() {
-        return None;
-    }
-    if crate::host::late() {
-        static SAID: std::sync::Once = std::sync::Once::new();
-        SAID.call_once(|| tracing::warn!("VICTORY_POOL_IN_PLACE=1 with VICTORY_LATE_WAIT: nothing placed in the page pool, copies as before"));
         return None;
     }
     let host = crate::host::host()?;
@@ -346,6 +347,20 @@ pub fn title_memory_freeing(at: usize, len: usize) {
     STATS[7].fetch_add(gone, Ordering::Relaxed);
 }
 
+/// Shader writes through title memory in place, declared in submissions
+/// sent ahead ([`crate::host::late`]) since the last line: ranges, bytes.
+static WRITTEN: [AtomicU64; 2] = [const { AtomicU64::new(0) }; 2];
+
+/// A submission sent ahead may write `ranges` (address, end) of title
+/// memory in place: counted for the line.
+pub(crate) fn written_ahead(ranges: &[(usize, usize)]) {
+    if ranges.is_empty() {
+        return;
+    }
+    WRITTEN[0].fetch_add(ranges.len() as u64, Ordering::Relaxed);
+    WRITTEN[1].fetch_add(ranges.iter().map(|&(from, to)| to.saturating_sub(from) as u64).sum(), Ordering::Relaxed);
+}
+
 /// The line of what is in place, every ten seconds while [`level`] or
 /// [`pool_in_place`] is on.
 fn say() {
@@ -368,6 +383,14 @@ fn say() {
         s[6],
         s[7]
     );
+    if crate::host::late() {
+        let [ranges, bytes] = [0, 1].map(|i| WRITTEN[i].swap(0, Ordering::Relaxed));
+        tracing::info!(
+            "title memory in place written by shaders in submissions sent ahead, last ten seconds: {ranges} ranges, {} MB declared; \
+             kept in the air until their flight has run (our reads of them wait), none copied back",
+            bytes >> 20
+        );
+    }
     if pool_in_place() {
         let p: Vec<u64> = POOL.iter().map(|s| s.load(Ordering::Relaxed)).collect();
         tracing::info!(

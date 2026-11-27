@@ -3015,11 +3015,18 @@ impl Shadow {
     /// a GPU-side dirty mask would save that if big ranges make it slow.
     pub(crate) fn gpu_writes(self: &Arc<Self>, list: &HostList, address: u64, len: u64) {
         // In place the shaders write title memory itself: no snapshot, no
-        // compare, nothing to copy back, and no wait on its account.
+        // compare, nothing to copy back. With submissions sent ahead
+        // (`crate::host::late`), the range is still declared, so that it
+        // counts as in the air until the card has run the list (see
+        // `take_in_place` in host.rs). Waited for, nothing is in the air.
         // shortcut: another host copy of the same bytes (a title buffer
         // inside this one with a copy of its own, a texture in it) is not
         // told: the card's writes are not seen by write watching.
         if self.place.is_some() {
+            if crate::host::late() {
+                let len = len.min(self.left(address));
+                list.defer_gpu_write(self, address as usize, len as usize);
+            }
             return;
         }
         self.written.store(true, Ordering::Relaxed);
@@ -4435,6 +4442,21 @@ impl Shadow {
         shadow
     }
 
+    /// Title memory `[start, start + len)` as if in place ([`Shadow::placed`]),
+    /// with no heap or buffer behind it. Never let go.
+    pub(crate) fn unbacked_in_place(start: u64, len: u64) -> Arc<Shadow> {
+        // SAFETY: interface pointers nothing calls.
+        let none = || unsafe { std::mem::transmute::<usize, ID3D12Resource>(8) };
+        let heap = unsafe { std::mem::transmute::<usize, windows::Win32::Graphics::Direct3D12::ID3D12Heap>(8) };
+        let mut shadow = Shadow::new(none(), start as *mut u8, 0, start, len);
+        *shadow.watched.get_mut() = NOT_WATCHED;
+        shadow.window = true;
+        shadow.place = Some((heap, 0));
+        let shadow = Arc::new(shadow);
+        std::mem::forget(shadow.clone());
+        shadow
+    }
+
     /// What shaders wrote goes into title memory ([`put_changed`]).
     pub(crate) fn put(at: usize, title: &[u8], merged: &[u8]) {
         put_changed(at, title, merged);
@@ -4982,9 +5004,10 @@ fn lookup(address: u64, len: u64, any: bool) -> Option<Arc<Shadow>> {
             entry.shadow = Some(Arc::new(Shadow::placed(placed, key.0, len, false)));
             return entry.shadow.clone();
         }
-        // The page pool in place (`VICTORY_POOL_IN_PLACE=1`), big or not,
-        // as renderer port 1: one run of a section, placed in the section.
-        if let Some(placed) = crate::inplace::pool_place_for(key.0, len, false) {
+        // The page pool in place (`VICTORY_POOL_IN_PLACE=1`): one run of a
+        // section, placed in the section. Not the big ones either: they keep
+        // their copy in the card's memory, where the card reads them fast.
+        if !big && let Some(placed) = crate::inplace::pool_place_for(key.0, len, false) {
             entry.shadow = Some(Arc::new(Shadow::placed(placed, key.0, len, false)));
             return entry.shadow.clone();
         }

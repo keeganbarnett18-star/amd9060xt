@@ -2710,8 +2710,11 @@ struct Sent {
     back: Vec<Declared>,
     /// What was taken off it to be done on the card.
     own: Option<card_steps::Taken>,
-    /// Title-memory ranges written when its shader textures are copied back.
-    texture_back_ranges: Vec<(usize, usize)>,
+    /// Title-memory ranges it writes that `back` does not copy back: its
+    /// shader textures' read-backs, and what its shaders write through
+    /// title memory in place ([`take_in_place`]). In the air until it has
+    /// run, as `back`'s ranges are.
+    air_ranges: Vec<(usize, usize)>,
     /// Its bottom-of-pipe writes.
     writes: Vec<(usize, crate::queue::Written, usize)>,
 }
@@ -2729,7 +2732,8 @@ struct Flight {
     back: Vec<Declared>,
     /// The list of ours that ran ahead of them ([`card_steps`]).
     own: Option<card_steps::Taken>,
-    texture_back_ranges: Vec<(usize, usize)>,
+    /// See [`Sent`]'s.
+    air_ranges: Vec<(usize, usize)>,
 }
 
 /// One thing in the line of what waits for the card, in order.
@@ -3784,7 +3788,7 @@ pub(crate) use stamps::{timeline_ready, timeline_restart, timeline_stamps};
 
 #[cfg(test)]
 mod late_tests {
-    use super::{continues, join_ranges, touches};
+    use super::{Declared, continues, join_ranges, take_in_place, touches};
 
     /// Copies join only when both ends continue and the whole does not
     /// overlap itself.
@@ -3831,6 +3835,44 @@ mod late_tests {
             assert_eq!(touches(&ranges, from, to), hit, "{from}..{to}");
         }
         assert!(!touches(&[], 0, usize::MAX));
+    }
+
+    /// Writes through title memory in place leave the copy-back list and
+    /// are given back as ranges; host copies stay where they are.
+    #[test]
+    fn in_place_writes_are_taken_out_of_the_copy_back() {
+        let mut title = vec![0u8; 0x4000];
+        let copy = crate::shadow::Shadow::unbacked(0x1000_0000, title.as_mut_ptr(), 0x4000, false);
+        let placed = crate::shadow::Shadow::unbacked_in_place(0x2000_0000, 0x10000);
+        let mut back: Vec<Declared> = vec![
+            (copy.clone(), vec![(0x1000_0000, 0x1000_0100)]),
+            (placed.clone(), vec![(0x2000_0000, 0x2000_0040), (0x2000_8000, 0x2000_9000)]),
+        ];
+        let air = take_in_place(&mut back);
+        assert_eq!(air, [(0x2000_0000, 0x2000_0040), (0x2000_8000, 0x2000_9000)]);
+        assert_eq!(back.len(), 1);
+        assert!(std::sync::Arc::ptr_eq(&back[0].0, &copy));
+        assert_eq!(back[0].1, [(0x1000_0000, 0x1000_0100)]);
+        // Nothing in place: nothing taken.
+        let mut only_copies: Vec<Declared> = vec![(copy.clone(), vec![(0x1000_0000, 0x1000_0010)])];
+        assert!(take_in_place(&mut only_copies).is_empty());
+        assert_eq!(only_copies.len(), 1);
+    }
+
+    /// While a flight that writes title memory in place is in the air, a
+    /// read of those bytes touches what is in the air (so it waits); a read
+    /// beside them does not.
+    #[test]
+    fn in_place_writes_count_as_in_the_air() {
+        let placed = crate::shadow::Shadow::unbacked_in_place(0x3000_0000, 0x10000);
+        let mut back: Vec<Declared> = vec![(placed, vec![(0x3000_1000, 0x3000_2000)])];
+        let air = take_in_place(&mut back);
+        let mut written = Vec::new();
+        join_ranges(&mut written, back.iter().flat_map(|(_, r)| r.iter().copied()).chain(air.iter().copied()));
+        assert!(touches(&written, 0x3000_1800, 0x3000_1804));
+        assert!(touches(&written, 0x3000_0000, 0x3000_1001));
+        assert!(!touches(&written, 0x3000_2000, 0x3000_3000));
+        assert!(!touches(&written, 0x3000_0000, 0x3000_1000));
     }
 }
 
@@ -3905,6 +3947,32 @@ fn declared_writes(runs: &[&HostList]) -> Vec<Declared> {
         }
     }
     back
+}
+
+/// Takes the copies that are title memory in place out of `back` and gives
+/// their ranges. Their shaders write title memory itself, so nothing is
+/// compared or copied back. Their ranges still go into what flights may
+/// write ([`Sent::air_ranges`], then `Line::written`), so that while the
+/// submission is in the air:
+/// - a step of ours that reads those bytes waits for it ([`late`], point 2);
+/// - a wait for a memory value there counts as not met (point 4).
+///
+/// Without them, the rules saw nothing there and read what the card had
+/// not written yet. ([`Shadow::gpu_writes`] declares such ranges only with
+/// [`late`]; waited for, nothing is in the air.)
+///
+/// [`Shadow::gpu_writes`]: crate::shadow::Shadow::gpu_writes
+fn take_in_place(back: &mut Vec<Declared>) -> Vec<(usize, usize)> {
+    let mut ranges = Vec::new();
+    back.retain(|(shadow, declared)| {
+        if shadow.in_place() {
+            ranges.extend(declared.iter().copied());
+            false
+        } else {
+            true
+        }
+    });
+    ranges
 }
 
 /// The walls trace (`VICTORY_WALLS_TRACE=1` or `2`; off by default): log
@@ -5055,7 +5123,7 @@ impl Host {
                 if let Late::Run(flight) = item {
                     *lists += flight.order.len().max(1);
                     ranges.extend(flight.back.iter().flat_map(|(_, r)| r.iter().copied()));
-                    ranges.extend(flight.texture_back_ranges.iter().copied());
+                    ranges.extend(flight.air_ranges.iter().copied());
                 }
             }
             join_ranges(written, ranges);
@@ -5276,7 +5344,7 @@ impl Host {
                 sent.back
                     .iter()
                     .flat_map(|(_, ranges)| ranges.iter().copied())
-                    .chain(sent.texture_back_ranges.iter().copied()),
+                    .chain(sent.air_ranges.iter().copied()),
             );
             *flying += order.len();
             *target = *submitted;
@@ -5288,7 +5356,7 @@ impl Host {
                 card: sent.card,
                 back: sent.back,
                 own: sent.own,
-                texture_back_ranges: sent.texture_back_ranges,
+                air_ranges: sent.air_ranges,
             }));
             items.extend(sent.writes.into_iter().map(|(at, what, bytes)| Late::Write(at, what, bytes)));
             *flying >= late_most()
@@ -5331,7 +5399,7 @@ impl Host {
                 sent.back
                     .iter()
                     .flat_map(|(_, ranges)| ranges.iter().copied())
-                    .chain(sent.texture_back_ranges.iter().copied()),
+                    .chain(sent.air_ranges.iter().copied()),
             );
             *flying += 1;
             *target = *submitted;
@@ -5343,7 +5411,7 @@ impl Host {
                 card: sent.card,
                 back: sent.back,
                 own: sent.own,
-                texture_back_ranges: sent.texture_back_ranges,
+                air_ranges: sent.air_ranges,
             }));
             items.extend(sent.writes.into_iter().map(|(at, what, bytes)| Late::Write(at, what, bytes)));
         }
@@ -5753,7 +5821,8 @@ impl Host {
         for (shadow, at, len) in &picked.written {
             shadow.writing(*at, *len);
         }
-        let declared = declared_writes(runs);
+        let mut declared = declared_writes(runs);
+        let mut air_ranges = take_in_place(&mut declared);
         let card = self.card_before(&declared, &picked, flown);
         // The sends are taken: from here on the references hold what the
         // copies in the lists put.
@@ -5813,10 +5882,11 @@ impl Host {
             }
             #[cfg(feature = "diagnostics")]
             split.part(5);
-            let back = crate::picked::with(declared, &picked.written);
-            let mut texture_back_ranges = Vec::new();
+            let mut back = crate::picked::with(declared, &picked.written);
+            air_ranges.extend(take_in_place(&mut back));
+            crate::inplace::written_ahead(&air_ranges);
             for list in runs {
-                texture_back_ranges.extend(list.deferred().texture_backs.iter().map(crate::texback::Back::range));
+                air_ranges.extend(list.deferred().texture_backs.iter().map(crate::texback::Back::range));
             }
             let writes = runs.iter().flat_map(|l| l.deferred().writes.clone()).collect();
             SUBMISSION_US[0].fetch_add((prepared - started).saturating_sub(settled).as_micros() as u64, Ordering::Relaxed);
@@ -5828,7 +5898,7 @@ impl Host {
                 card,
                 back,
                 own,
-                texture_back_ranges,
+                air_ranges,
                 writes,
             };
             working(was_working);
