@@ -1,126 +1,131 @@
-# cool_fox (CGBJ Runtime Continuation)
+# VIctory for the Radeon RX 9060 XT
 
-[![CI](https://github.com/DoubleGhosty/cool_fox/actions/workflows/ci.yml/badge.svg)](https://github.com/DoubleGhosty/cool_fox/actions/workflows/ci.yml)
-[![PortWatch VI](https://img.shields.io/badge/PortWatch%20VI-91.5%25%20Playable-brightgreen)](https://portwatch-vi.xyz/#effort-cgbj)
+A fork of the [VIctory](https://github.com/Marvisak/VIctory) compatibility layer,
+which runs an Xbox Series title natively on Windows through Direct3D 12, tuned
+and measured on an **AMD Radeon RX 9060 XT (16 GB)** with a **Ryzen 7 9800X3D**
+and **32 GB of RAM**. The goal: a steady frame rate with no crashes, good
+lighting and models, and less memory than the console's unified memory
+otherwise costs on a PC.
 
-Active community continuation and development branch of `cool_fox` (the CGBJ runtime, ranked **#1 / 91.5% Playable** on PortWatch VI).
+This repository holds code only: no game files, assets or executables. You need
+your own legal dump of the game.
 
-This build unites the cutting-edge optimizations from leading PortWatch projects (`avatarmanz`, `codec-d`, `DexNom`, `Belobug`, and community contributors) into a unified, verified runtime for both AMD Radeon and NVIDIA GeForce GPUs.
+## Where it stands
 
----
+Measured on the PC above, 1080p output, Series X profile, a scripted 17-minute
+walk and boat ride through the opening hours (warm shader caches):
 
-## Key Features & Improvements
+| | |
+|---|---|
+| Frame rate | about **29 fps** (34-35 ms a frame) where the world has loaded |
+| Slow moments | about 1 in 5 reports over 40 ms; worst hitch 162 ms |
+| Game memory | **26-28 GB** (was 30-35 GB before this fork's memory work) |
+| Video memory | about 13 GB, kept under the card's budget |
+| Crashes | none in 17- and 20-minute unattended runs |
 
-- **Pareto Memory Residency & 32 GB RAM Support:** Adaptive GPU memory residency limits, preventing WDDM paging exhaustion (`0x8007000E`) on mid-range and 32 GB systems.
-- **Shader LOD Slot Fix (PR #2):** Leaves unused LOD slots undefined in array texture coordinate queries, resolving DXIL validator errors on retail shaders.
-- **NVIDIA & Video Stream Synchronization (PR #6):** Synchronous flush for decoded video frame copies, eliminating stutter and repeated frames in opening videos during multithreaded recording (`VICTORY_THIN=1`), and constant ambient lighting (`VICTORY_AMBIENT=constant:0.8`).
-- **Wine / Proton & DXIL Robustness (PR #10):** Code-generated root signatures replacing fragile comment pragmas for vkd3d-shader, single-latch DXIL loop CFG normalization, and 256 MiB pipeline worker stack.
-- **Voxel Visibility Recovery:** Restores wave64 mask provenance when restored from scalar copies, enabling foliage and volumetric voxel visibility shaders to pass compilation.
-- **Custom Resolution & Scaling:** `VICTORY_OUTPUT=1920x1080` (or `2560x1440`) and `VICTORY_RENDER_SCALE=0.667..1.0` with the 4K backbuffer pool check bypass.
-- **Frame Rate Unlock:** `VICTORY_FRAME_INTERVAL_MS=16.667` (60 FPS) or `8.333` (120 FPS) while keeping game simulation clock strictly at 1.00x.
-- **Renderer Port 5 (Zero-Copy CBV):** `VICTORY_PORT_CBV=1` reads constant buffers as raw bytes in-place, eliminating ~22,000 buffer copies per frame.
+Its first session after an update runs at about 23 fps while it rebuilds its
+shader caches; from the second session on it is back to normal.
 
----
+### Known issues
 
-## How to Run
+- **Dips in busy areas and while new areas load.** The processor is the limit
+  (about 9 cores' worth of work); new areas also bring shaders seen for the
+  first time, which take up to a second each to build. A second visit is
+  smoother. On a 32 GB PC, close other programs: the game needs most of the RAM.
+- **Textures that flash black, or leaves that go see-through for a frame.** Much
+  rarer since the prelude upload fix below; some remain, especially in combat.
+- **One rare crash** ("device removed: invalid call") while descriptor views are
+  being made, seen twice in long play sessions; its cause is being traced with
+  the D3D12 debug layer.
+- **Menus are laid out slightly too large** (left edge cut off in Settings), and
+  the game runs in a window, not fullscreen.
 
-You need Windows 10/11 x64, a CPU with AVX2, a Direct3D 12 GPU with shader model 6.6 and mesh shaders, Rust (1.98+), MSVC build tools, and your own legal Xbox Series dump of the game.
+## What this fork changes
 
-### Build from Source
+Each change was measured before it was kept; numbers are in the commit messages
+and in `docs/findings.md`.
+
+- **The graphics card reads game memory in place** instead of through copies:
+  the program ships with Microsoft's DirectX 12 Agility SDK runtime, which has
+  `ID3D12Device13` (the system's own runtime on this PC did not), and
+  `VICTORY_INPLACE=1` opens windows of title memory as heaps. About 3 GB less
+  RAM, smaller hitches, same frame rate.
+- **Texture uploads are recorded right before the list that needs them**
+  (ported from Belobug's fork): a texture the game changed no longer shows its
+  old or empty contents for a frame.
+- **Memory leaks closed**: a table of view shapes that grew by 2,000 entries a
+  second (the game leaves junk in padding bytes), and command lists that each
+  kept 1 MB or more of the driver's memory while idle.
+- **Video memory kept under budget**: texture blocks are packed, and the
+  emptiest are drained when the card passes 92 % of its budget (16.2 -> 13.4 GB).
+- From fxceless' fork and the forks it gathers: list calls written down and
+  translated on threads of our own, submissions prepared and joined on helper
+  threads, texture uploads on their own copy queue, shader writes landed beside
+  the write guards, and frame record and replay ([docs/replay.md](docs/replay.md)).
+
+## How to run
+
+You need Windows 10/11 x64, a CPU with AVX2, a Direct3D 12 GPU with shader
+model 6.6 and mesh shaders, Rust (1.98 or newer) with the MSVC build tools, and
+your own dump of the game.
 
 ```powershell
-git clone https://github.com/DoubleGhosty/cool_fox.git
-cd cool_fox
+git clone https://github.com/keeganbarnett18-star/amd9060xt.git
+cd amd9060xt
 cargo build --release --locked -p victory
+powershell -ExecutionPolicy Bypass -File scripts\get-agility.ps1
 ```
 
-### Launch
+`get-agility.ps1` fetches Microsoft's DirectX 12 Agility SDK runtime from
+nuget.org, checks its signature, and puts it in `target\release\D3D12`. Without
+it the game still runs, but memory is copied instead of read in place.
+
+Then launch with your dump's folder:
 
 ```powershell
 $env:VICTORY_GAME_DIR = 'D:\Games\MyDump'
-.\Play-VIctory.cmd
+.\Play-9060XT.cmd
 ```
 
-For 4GB / 8GB VRAM laptops or low-memory systems, you can also launch with:
-
-```powershell
-.\Play-VIctory-4GB.cmd
-```
-
----
-
-## Upstream & Acknowledgements
-
-- **codec-d / CGBJ:** Original `cool_fox` runtime and pareto residency architecture.
-- **AvatarManz (VIctory-7900XTX):** Multi-threaded command list recording, framerate unlocking, and renderer ports.
-- **DexNom:** Wave64 lowering, scalar recovery, and shader structure passes.
-- **Belobug:** Ambient lighting and integer target blend protections.
-- **Marvisak & fxceless:** Foundational VIctory compatibility layer.
-
-**Legal notice:** This repository contains no copyrighted game code, assets, or executables. All code is licensed under GPL-3.0-or-later.
-copy victory.example.toml victory.toml      # then set your paths, outside this folder
-cargo build --locked --profile diag -p victory --features diagnostics
-scripts\play.ps1 -Exe <path of your copy's executable>
-```
-
-`scripts\play.ps1 -Safe` leaves out the newest, faster ways; try it first when
-something is wrong. `-RayTracing` turns the title's ray-traced indirect light on.
-
-Before the first run, ahead of time (both can be stopped and go on later):
-
-```powershell
-target\diag\victory.exe shaders <the shader archives>   # every shader translated, minutes
-target\diag\victory.exe warm --used                     # pipelines earlier runs drew with, for a new driver or build
-```
-
-Commands, debugging switches and upstream's own description:
-[docs/README-fxceless.md](docs/README-fxceless.md). Every `VICTORY_...` switch is
-described in a comment where it is read.
-
-## What is different here
-
-In short; the reasons and the measurements are in [docs/findings.md](docs/findings.md).
-
-- **List calls are written down, not carried out, on the title's threads**
-  (`VICTORY_THIN`): eight threads of ours translate them.
-- **Submissions are prepared by a thread of ours and joined**
-  (`VICTORY_ASYNC_SUBMIT`, `VICTORY_JOIN_PARTS`), with what can be spread over
-  threads spread: refreshes, compares (AVX2), descriptor records, landings.
-- **What shaders wrote comes back beside the write guards**, by the dwords that
-  changed, on a thread of its own (`VICTORY_RELAY`, `VICTORY_LAND`).
-- **Buffer fills that need bytes still on the card are done on the card**
-  (`VICTORY_CARD_STEPS`) instead of waiting for it.
-- **The title's writes are caught more cheaply**: one view opened at a fault,
-  blocks that rest, places in the title's code that look before they write.
-- **Textures go up on a copy queue of their own** and a slot shows one only after
-  its upload ran, which also ended a device loss that came every 15 minutes or so.
-- **Boats float**: textures that shaders write and the title's CPU reads go back
-  to title memory (from fxceless and Geckomacabre, on by default here).
-- **Frame record and replay** with per-pass times and shader variants compared
-  turn by turn ([docs/replay.md](docs/replay.md)).
+`Play-9060XT.cmd` has this card's settings; `Play-VIctory.cmd` is the general
+one (NVIDIA and AMD, 8 GB and up) and `Play-VIctory-4GB.cmd` the low-memory one.
+Any `VICTORY_...` setting you set before launching wins; each is described in a
+comment where the code reads it. Upstream's own description, commands and
+debugging switches: [docs/README-fxceless.md](docs/README-fxceless.md).
 
 ## Credits
 
-This is a tree of other people's work with more on top. The history is kept, and
-commits taken from elsewhere name the commit and its author.
+This is a tree of other people's work with more on top. The history is kept,
+and commits taken from elsewhere name their source and author.
 
 - **[VIctory](https://github.com/Marvisak/VIctory)** by Marvisak and its
   contributors: the loader, the runtime services, the Direct3D 12 back end and
   the shader recompiler.
-- **[fxceless/victory-fork](https://github.com/fxceless/victory-fork)**: the fork
-  this one started from, and the people whose pull requests it carries.
-- **[DexNom/VIctory](https://github.com/DexNom/VIctory)**: ray tracing fixes,
-  cube gradients, sparse textures.
-- **[Belobug/VIctory-Belobug-AMD](https://github.com/Belobug/VIctory-Belobug-AMD)**:
+- **[fxceless/victory-fork](https://github.com/fxceless/victory-fork)**: the
+  fork this one started from, and the people whose pull requests it carries.
+- **[cool_fox](https://github.com/DoubleGhosty/cool_fox)** by DoubleGhosty and
+  codec-d (the CGBJ runtime): pareto memory residency, launch profiles,
+  renderer ports and the community continuation this fork merged.
+- **[Belobug/VIctory-Belobug-AMD](https://github.com/Belobug/VIctory-Belobug-AMD)**
+  by Belobug: the texture prelude upload fix ported here, the RX 9070 XT work,
   the ambient light idea, pipeline workers, and work by romainhedouin.
+- **[avatarmanz/VIctory-7900XTX](https://github.com/avatarmanz/VIctory-7900XTX)**:
+  renderer ports 6 and 7, threaded recording, frame rate unlocking.
+- **[DexNom/VIctory](https://github.com/DexNom/VIctory)**: ray tracing fixes,
+  wave64 lowering, cube gradients, sparse textures, FidelityFX work.
 - **[FQY55kai/ZJOU-VICTORY](https://github.com/FQY55kai/ZJOU-VICTORY)**.
 - **[myokex/victory-amd](https://github.com/myokex/victory-amd)**: the guard over
   every view of a page (with Spexivus, joroyt and tightfall), and Joshua Odom's
   reads into title memory.
-- **Geckomacabre** and **cxy0072019-sketch**: the texture read-back.
-- **[XCL](https://github.com/ivall/xcl)** (GPL-2.0-only) was read for how the same
-  title behaves under another layer; no code of it is here.
-- This fork's changes were made with [Claude Code](https://claude.com/claude-code).
+- **Geckomacabre** and **cxy0072019-sketch**: the texture read-back that makes
+  boats float.
+- **[XCL](https://github.com/ivall/xcl)** (GPL-2.0-only) was read for how the
+  same title behaves under another layer; no code of it is here.
+- **Microsoft's [DirectX 12 Agility SDK](https://devblogs.microsoft.com/directx/directx12agility/)**:
+  its redistributable runtime is fetched by `scripts\get-agility.ps1` and is
+  not part of this repository.
+- This fork's changes were made and measured with
+  [Claude Code](https://claude.com/claude-code).
 
 ## License
 
